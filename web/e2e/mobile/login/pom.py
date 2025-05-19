@@ -2,12 +2,15 @@ import pytest
 from playwright.sync_api import Playwright, Page, expect
 from time import sleep
 
+# We're using the TestJourney class approach from the test file, not decorators
+# from ...utils.metrics import TestJourney
+
 
 @pytest.fixture(scope="function")
 def page(playwright: Playwright):
     # Using iPhone 13 device descriptor for consistent mobile testing
     iphone_13 = playwright.devices['iPhone 13']
-    browser = playwright.webkit.launch(headless=False)
+    browser = playwright.webkit.launch(headless=True)
     context = browser.new_context(**iphone_13)
     page = context.new_page()
     
@@ -21,6 +24,7 @@ def page(playwright: Playwright):
 # Step 1: Navigate to HOT website and open mobile menu
 def navigate_to_hot_website(page: Page):
     """Navigate to the HOT website and open the mobile menu"""
+    
     page.goto("https://www.hot.net.il/heb/main/")
     page.get_by_role("link", name="לחץ לפתוח תפריט מובייל").click()
     

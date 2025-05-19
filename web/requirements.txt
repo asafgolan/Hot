@@ -1,0 +1,5 @@
+playwright>=1.42.0  # Latest Playwright version
+pytest>=7.4.3  # Stable test framework
+pytest-playwright>=0.4.0  # Pytest plugin for Playwright
+pytest-html>=4.1.1  # HTML report generation
+prometheus-client==0.17.1  # Pytest plugin for Playwright

@@ -1,0 +1,41 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hot-mobile-e2e-scheduled-tests
+  namespace: hot-e2e-tests
+  labels:
+    app: playwright-tests
+spec:
+  schedule: "0 2 * * *"  # Run daily at 2 AM
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: playwright-tests
+            image: hot-mobile-tests:v4
+            imagePullPolicy: IfNotPresent # Use cached only if exact tag matches
+            env:
+            - name: LANG
+              value: "he_IL.UTF-8"
+            - name: LC_ALL
+              value: "he_IL.UTF-8"
+            resources:
+              requests:
+                memory: "1Gi"
+                cpu: "0.5"
+              limits:
+                memory: "2Gi"
+                cpu: "1"
+            command: ["/bin/bash", "-c"]
+            args:
+              - "python -m pytest e2e/mobile/login/login_invalid_otp.py -v --html=/test-results/report.html"
+            volumeMounts:
+            - name: test-results
+              mountPath: /test-results
+          volumes:
+          - name: test-results
+            persistentVolumeClaim:
+              claimName: hot-e2e-test-results
+          restartPolicy: Never
