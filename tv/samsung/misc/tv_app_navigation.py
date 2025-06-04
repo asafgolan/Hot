@@ -94,38 +94,6 @@ def patched_send(self, data, *args, **kwargs):
     # Call original method
     return original_send(self, data, *args, **kwargs)
 
-# Function to process WebSocket receive events
-def on_message(ws, message):
-    try:
-        message_type = "binary"
-        message_content = message
-        event_type = "unknown"
-        
-        if isinstance(message, str):
-            try:
-                parsed = json.loads(message)
-                message_type = "json"
-                message_content = parsed
-                event_type = parsed.get('event', 'unknown')
-                
-                logger.info(f"📥 Received: {event_type}")
-                
-                with ws_lock:
-                    ws_messages.append({
-                        'direction': 'received',
-                        'timestamp': datetime.now().isoformat(),
-                        'type': message_type,
-                        'event_type': event_type,
-                        'content': message_content
-                    })
-            except json.JSONDecodeError:
-                # Not JSON data
-                message_type = "text"
-        
-        logger.debug(f"++Rcv {message_type}: {message_content}")
-    except Exception as e:
-        logger.debug(f"Error logging received message: {e}")
-
 # Initialize Samsung TV connection
 def init_tv():
     # Apply the WebSocket patch
@@ -143,13 +111,6 @@ def init_tv():
         name=CLIENT_NAME,
         timeout=CONNECTION_TIMEOUT
     )
-    
-    # Get token if needed
-    # try:
-    #     token = tv.token
-    #     logger.info(f"Using token: {token}")
-    # except Exception as e:
-    #     logger.warning(f"Could not get token: {e}")
     
     # Test connection
     for attempt in range(3):
