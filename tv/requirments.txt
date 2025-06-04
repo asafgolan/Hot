@@ -1,4 +1,13 @@
-websockets 
-pytest
-pytest-asyncio
-pytest
+# TV Testing Framework Dependencies
+websockets==11.0.3
+pytest==7.4.3
+pytest-asyncio==0.23.5
+prefect=>=3.4.4
+
+# Samsung TV WebSocket dependencies
+samsungtvws[async,encrypted]==2.6.0
+
+# General Python dependencies
+requests>=2.28.2
+websocket-client>=1.6.0
+urllib3>=2.0.3

@@ -5,3 +5,5 @@ __pycache__
 debug_screenshots
 hot-e2e-test-results
 __pycache__
+tv/samsung/.DS_Store
+test_results
