@@ -164,30 +164,30 @@ def navigate_and_select_app(tv):
         logger.info("5. Waiting to capture app launch messages...")
         time.sleep(5)
         
-        # 6. Return to home
-        logger.info("6. Returning to home...")
-        tv.shortcuts().home()
-        time.sleep(2)
+        # # 6. Return to home
+        # logger.info("6. Returning to home...")
+        # tv.shortcuts().home()
+        # time.sleep(2)
         
-        # 7. Try with another app - navigate right first
-        logger.info("7. Navigating to second app...")
-        # Down to apps row again
-        for i in range(2):
-            tv.send_key("KEY_DOWN")
-            time.sleep(1)
+        # # 7. Try with another app - navigate right first
+        # logger.info("7. Navigating to second app...")
+        # # Down to apps row again
+        # for i in range(2):
+        #     tv.send_key("KEY_DOWN")
+        #     time.sleep(1)
         
-        # Move right to next app
-        tv.send_key("KEY_RIGHT")
-        time.sleep(1)
+        # # Move right to next app
+        # tv.send_key("KEY_RIGHT")
+        # time.sleep(1)
         
-        # Open the second app
-        logger.info("8. Opening second app...")
-        tv.send_key("KEY_ENTER")
-        time.sleep(5)
+        # # Open the second app
+        # logger.info("8. Opening second app...")
+        # tv.send_key("KEY_ENTER")
+        # time.sleep(5)
         
-        # Return to home
-        logger.info("9. Returning to home...")
-        tv.shortcuts().home()
+        # # Return to home
+        # logger.info("9. Returning to home...")
+        # tv.shortcuts().home()
         
         logger.info("✅ Navigation test completed")
         return True
