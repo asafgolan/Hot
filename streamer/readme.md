@@ -21,3 +21,12 @@ adb -s 192.168.1.10:32869 shell am start -n il.net.hot.hot/il.net.hot.hot.TvMain
 
 
 adb -s 192.168.1.10:32869 shell am start -n il.net.hot.hot/il.net.hot.hot.TvMainActivity
+
+
+dump ui to sd card
+
+ adb -s 192.168.1.10:33237 shell uiautomator dump /sdcard/ui_enhanced.xml 
+
+ pull
+
+ adb -s 192.168.1.10:33237 pull /sdcard/ui_enhanced.xml ~/Hot/ui_enhanced.xml
