@@ -158,7 +158,7 @@ addons = [CaptureAllRelatedResources()]
         process = subprocess.Popen(cmd)
         
         # Wait for process to finish or timeout
-        process.wait(timeout=30)
+        process.wait(timeout=60)
         return True
     except Exception as e:
         print(f"Error recording flow: {e}")
@@ -263,7 +263,7 @@ def process_request_file(file_path):
             
             # Make the request
             try:
-                response = urllib.request.urlopen(req, data=data, context=context, timeout=15)
+                response = urllib.request.urlopen(req, data=data, context=context, timeout=30)
                 
                 # Read response data
                 response_body = response.read()

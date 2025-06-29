@@ -142,9 +142,9 @@ class SimpleProxyHandler(http.server.BaseHTTPRequestHandler):
                 print(f"Created request file: {outgoing_file}")
                 print(f"Waiting for Windows to process request...")
             
-            # Wait for response file
+            # Wait for a maximum of 60 seconds for the response file
             response_file = os.path.join(incoming_dir, f"resp_{request_id}.json")
-            timeout = 30  # seconds
+            timeout = 60  # seconds
             start_time = time.time()
             
             while not os.path.exists(response_file) and (time.time() - start_time < timeout):
