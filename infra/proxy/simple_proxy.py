@@ -17,9 +17,13 @@ import traceback
 import base64
 from urllib.parse import urlparse, parse_qs
 
+# Global dictionary to track recent requests and prevent duplicates
+recent_requests = {}
+
 # Configuration
 PORT = 8000
 DEBUG = True
+
 
 # List of domains to ignore/handle specially
 IGNORED_DOMAINS = [
@@ -37,6 +41,9 @@ IGNORED_DOMAINS = [
 
 class SimpleProxyHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
+        # Access the global recent_requests dictionary
+        global recent_requests
+        
         url = self.path
         
         # If URL doesn't have a protocol, add it
@@ -81,7 +88,41 @@ class SimpleProxyHandler(http.server.BaseHTTPRequestHandler):
             import time
             import json
             
-            request_id = str(uuid.uuid4())
+            # Check if we've seen this request recently
+            global recent_requests
+            request_key = f"{url}"
+            current_time = time.time()
+            
+            # Check for duplicate requests within 5 seconds
+            if request_key in recent_requests:
+                last_time = recent_requests[request_key]['time']
+                if current_time - last_time < 5:  # 5 second deduplication window
+                    if DEBUG:
+                        print(f"Duplicate request detected for {url}, using existing request ID")
+                    request_id = recent_requests[request_key]['id']
+                    duplicate_request = True
+                else:
+                    # If it's been more than 5 seconds, treat as new request
+                    request_id = str(uuid.uuid4())
+                    duplicate_request = False
+            else:
+                request_id = str(uuid.uuid4())
+                duplicate_request = False
+            
+            # Store in recent requests
+            recent_requests[request_key] = {
+                'id': request_id, 
+                'time': current_time
+            }
+            
+            # Clean up old entries from the recent_requests dictionary
+            to_delete = []
+            for key, value in recent_requests.items():
+                if current_time - value['time'] > 60:  # Remove entries older than 1 minute
+                    to_delete.append(key)
+            for key in to_delete:
+                del recent_requests[key]
+            
             outgoing_dir = os.path.expanduser("~/Hot/infra/proxy/bt_transfer/outgoing")
             incoming_dir = os.path.expanduser("~/Hot/infra/proxy/bt_transfer/incoming")
             
@@ -133,14 +174,21 @@ class SimpleProxyHandler(http.server.BaseHTTPRequestHandler):
                 "likely_binary": likely_binary
             }
             
-            # Write request file
+            # If it's not a duplicate request, write the request file
             outgoing_file = os.path.join(outgoing_dir, f"req_{request_id}.json")
-            with open(outgoing_file, "w") as f:
-                json.dump(request_data, f, indent=2)
             
-            if DEBUG:
-                print(f"Created request file: {outgoing_file}")
-                print(f"Waiting for Windows to process request...")
+            if not duplicate_request:
+                with open(outgoing_file, "w") as f:
+                    json.dump(request_data, f, indent=2)
+                
+                if DEBUG:
+                    print(f"Created request file: {outgoing_file}")
+                    print(f"Waiting for Windows to process request...")
+            else:
+                if DEBUG:
+                    print(f"Using existing request ID {request_id} for duplicate request")
+                    print(f"Checking for existing response file...")
+            
             
             # Wait for a maximum of 60 seconds for the response file
             response_file = os.path.join(incoming_dir, f"resp_{request_id}.json")
@@ -189,6 +237,13 @@ class SimpleProxyHandler(http.server.BaseHTTPRequestHandler):
                                 if header.lower() not in ("transfer-encoding", "content-length"):
                                     self.send_header(header, value)
                             self.end_headers()
+                            
+                            # Delete the response file before returning for 304 responses
+                            try:
+                                os.remove(response_file)
+                                print(f"Deleted 304 response file: {response_file}")
+                            except Exception as e:
+                                print(f"Error deleting 304 response file: {e}")
                             return
                         
                         # Get content from either 'content' or 'body' field
@@ -558,14 +613,59 @@ def main():
     print(f"Looking for responses in: {incoming_dir}")
     print("Press Ctrl+C to stop")
     
-    socketserver.TCPServer.allow_reuse_address = True
-    httpd = socketserver.ThreadingTCPServer(('', PORT), SimpleProxyHandler)
-    
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        print("Stopping proxy server")
-        httpd.shutdown()
+    # Track recent requests to avoid duplicates
+    recent_requests = {}
+
+    def cleanup_old_response_files():
+        """Clean up response files that are older than 2 minutes"""
+        try:
+            incoming_dir = os.path.join(base_dir, "bt_transfer", "incoming")
+            if not os.path.exists(incoming_dir):
+                return
+                
+            current_time = time.time()
+            for filename in os.listdir(incoming_dir):
+                if filename.startswith("resp_") and filename.endswith(".json"):
+                    file_path = os.path.join(incoming_dir, filename)
+                    file_age = current_time - os.path.getmtime(file_path)
+                    
+                    # If file is older than 2 minutes, delete it
+                    if file_age > 120:  # 120 seconds = 2 minutes
+                        try:
+                            os.remove(file_path)
+                            print(f"Cleaned up old response file: {filename} (age: {file_age:.1f}s)")
+                        except Exception as e:
+                            print(f"Error cleaning up old file {filename}: {e}")
+        except Exception as e:
+            print(f"Error in cleanup routine: {e}")
+
+    def run_proxy_server():
+        # Allow reuse of address to avoid 'Address already in use' errors
+        socketserver.ThreadingTCPServer.allow_reuse_address = True
+        
+        # Create proxy server
+        server_address = ('localhost', PORT)  # Replace with your desired address and port
+        proxy_server = socketserver.ThreadingTCPServer(server_address, SimpleProxyHandler)
+        
+        print(f"Starting proxy server on {server_address[0]}:{server_address[1]}")
+        
+        # Start a background thread to clean up old response files
+        def cleanup_thread():
+            while True:
+                time.sleep(30)  # Run cleanup every 30 seconds
+                cleanup_old_response_files()
+                
+        import threading
+        cleanup = threading.Thread(target=cleanup_thread, daemon=True)
+        cleanup.start()
+        
+        try:
+            proxy_server.serve_forever()
+        except KeyboardInterrupt:
+            print("Stopping proxy server")
+            proxy_server.shutdown()
+
+    run_proxy_server()
 
 if __name__ == "__main__":
     main()
