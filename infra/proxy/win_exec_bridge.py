@@ -395,7 +395,15 @@ def check_request_files():
             
         for req_file in request_files:
             file_path = os.path.join(INCOMING_DIR, req_file)
-            process_request_file(file_path)
+            success = process_request_file(file_path)
+            
+            # Delete the request file after successful processing
+            if success and os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                    print(f"Deleted processed request file: {file_path}")
+                except Exception as e:
+                    print(f"Error deleting request file: {e}")
             
     except Exception as e:
         print(f"Error checking request files: {e}")

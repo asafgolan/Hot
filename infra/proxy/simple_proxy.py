@@ -274,8 +274,12 @@ class SimpleProxyHandler(http.server.BaseHTTPRequestHandler):
                     if DEBUG:
                         print(f"Response sent to browser: {status_code}")
                     
-                    # Clean up
-                    os.remove(response_file)
+                    # Clean up - delete file after successful processing
+                    try:
+                        os.remove(response_file)
+                        print(f"Deleted processed response file: {response_file}")
+                    except Exception as e:
+                        print(f"Error deleting response file: {e}")
                 except Exception as e:
                     if DEBUG:
                         print(f"Error processing response file: {e}")
