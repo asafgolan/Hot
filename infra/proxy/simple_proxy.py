@@ -133,13 +133,32 @@ class SimpleProxyHandler(http.server.BaseHTTPRequestHandler):
             # Create request file for Windows
             # Fix relative paths for resources
             final_url = url
+            
+            # Detect if this should be HTTPS based on URL or referer
+            original_scheme = parsed_url.scheme
+            use_https = original_scheme == 'https'
+            
+            # If URL is for hot.net, check if it should use HTTPS
+            if 'hot.net' in parsed_url.netloc or 'hot-buzz' in parsed_url.netloc:
+                # For hot-buzz domains, always use HTTPS on the Windows side
+                if 'hot-buzz' in parsed_url.netloc:
+                    use_https = True
+                    if DEBUG:
+                        print(f"Detected hot-buzz domain, using HTTPS: {parsed_url.netloc}")
+            
             if is_resource and not url.startswith('http'):
                 # This might be a relative path - reconstruct proper URL
                 referer = self.headers.get('Referer')
                 if referer:
                     # Extract base from referer
                     base_parts = urlparse(referer)
-                    base_url = f"{base_parts.scheme}://{base_parts.netloc}"
+                    scheme = base_parts.scheme
+                    
+                    # If referer uses HTTPS, our request should too
+                    if scheme == 'https':
+                        use_https = True
+                    
+                    base_url = f"{scheme}://{base_parts.netloc}"
                     
                     # Handle different relative path formats
                     if url.startswith('/'):
@@ -156,11 +175,28 @@ class SimpleProxyHandler(http.server.BaseHTTPRequestHandler):
                     if DEBUG:
                         print(f"Corrected relative URL: {url} -> {final_url}")
             
+            # Force scheme based on use_https flag
+            if use_https and not final_url.startswith('https://'):
+                # Replace http:// with https:// or add https:// if needed
+                if final_url.startswith('http://'):
+                    final_url = 'https://' + final_url[7:]
+                elif not final_url.startswith('http'):
+                    final_url = 'https://' + final_url
+            
             # Determine if this is likely a binary resource based on file extension
             likely_binary = False
             binary_extensions = ('.jpg', '.jpeg', '.png', '.gif', '.ico', '.pdf', '.woff', '.woff2', '.ttf', '.eot')
-            if parsed_url.path.lower().endswith(binary_extensions):
+            path_lower = parsed_url.path.lower()
+            
+            # Check both URL and path for binary extensions
+            if final_url.lower().endswith(binary_extensions) or path_lower.endswith(binary_extensions):
                 likely_binary = True
+                
+            # Special case for images in paths containing 'images' directory
+            if '/images/' in path_lower or '/img/' in path_lower:
+                likely_binary = True
+                if DEBUG:
+                    print(f"Detected likely image in path: {path_lower}")
                 if DEBUG:
                     print(f"Detected likely binary resource: {parsed_url.path}")
             
@@ -210,6 +246,32 @@ class SimpleProxyHandler(http.server.BaseHTTPRequestHandler):
                             
                         if DEBUG:
                             print(f"Response file content length: {len(response_content)} bytes")
+
+                        # Special handling for large files that might contain multiline base64
+                        if len(response_content) > 100000 and '"content": "' in response_content:
+                            if DEBUG:
+                                print("Large file with possible multiline base64 content detected, normalizing...")
+                            import re
+                            # Pattern to match the content field including multiline content
+                            pattern = r'("content": ")([^"]*?)(")'
+                            def normalize_base64(match):
+                                # Remove all whitespace from the base64 content part
+                                normalized = ''.join(match.group(2).split())
+                                return match.group(1) + normalized + match.group(3)
+                            
+                            try:
+                                # Use regex with DOTALL flag to handle newlines within the match
+                                normalized_content = re.sub(pattern, normalize_base64, response_content, flags=re.DOTALL)
+                                response_data = json.loads(normalized_content)
+                                if DEBUG:
+                                    print("Successfully parsed JSON with normalized base64 content")
+                            except (json.JSONDecodeError, re.error) as e:
+                                if DEBUG:
+                                    print(f"Normalization failed: {e}, falling back to original content")
+                                # Fall back to original parsing if normalization fails
+                                response_data = json.loads(response_content)
+                        else:
+                            response_data = json.loads(response_content)
                             
                         response_data = json.loads(response_content)
                     except json.JSONDecodeError as json_err:
@@ -218,9 +280,22 @@ class SimpleProxyHandler(http.server.BaseHTTPRequestHandler):
                             print(f"First 100 chars of file: {response_content[:100]}")
                         
                         # Try reading with different encoding
-                        with open(response_file, "r", encoding="latin-1") as f:
-                            response_content = f.read()
-                        response_data = json.loads(response_content)
+                        try:
+                            with open(response_file, "r", encoding="utf-8") as f:
+                                response_content = f.read()
+                        except UnicodeDecodeError:
+                            # If UTF-8 fails, read as binary and decode carefully
+                            with open(response_file, "rb") as f:
+                                response_content = f.read().decode('utf-8', errors='replace')
+                                print(f"Warning: Used fallback encoding for {response_file}")
+                        
+                        # Parse JSON with extra error handling
+                        try:
+                            response_data = json.loads(response_content)
+                        except json.JSONDecodeError as e:
+                            print(f"JSON decode error: {e}")
+                            print(f"First 100 chars of content: {response_content[:100]}")
+                            raise ValueError(f"Invalid JSON response format: {e}")
                     try:
                         # Parse response data
                         status_code = int(response_data.get('status', 500))
@@ -260,12 +335,28 @@ class SimpleProxyHandler(http.server.BaseHTTPRequestHandler):
                         else:
                             content_bytes = content.encode('utf-8') if content else b''
                         
-                        # Check if this is HTML content
+                        # Check content type and handle images properly
                         content_type = ''
                         for header_name, header_value in headers.items():
                             if header_name.lower() == 'content-type':
                                 content_type = header_value.lower()
                                 break
+                                
+                        # Force binary mode for common image types regardless of is_binary flag
+                        # This handles cases where content-type might be incorrectly set
+                        path_lower = parsed_url.path.lower()
+                        if any(ext in path_lower for ext in ['.jpg', '.jpeg', '.png', '.gif', '.ico']) or \
+                           any(img_type in (content_type or '') for img_type in ['image/png', 'image/jpeg', 'image/gif', 'image/x-icon']):
+                            if not is_binary:
+                                print(f"Forcing binary mode for image: {parsed_url.path} ({content_type})")
+                                is_binary = True
+                                # Re-decode content if needed
+                                if content and not content_bytes:
+                                    try:
+                                        content_bytes = base64.b64decode(content)
+                                    except:
+                                        # If not base64, treat as raw bytes
+                                        content_bytes = content.encode('latin1', errors='replace')
                         
                         # If HTML content, rewrite resource URLs to be absolute
                         if not is_binary and 'text/html' in content_type and isinstance(content, str):

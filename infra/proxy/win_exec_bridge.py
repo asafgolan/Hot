@@ -13,6 +13,7 @@ import re
 import datetime
 import base64
 import mimetypes
+import argparse
 
 # Constants
 INCOMING_DIR = r"C:\WebServerTest\bt_transfer\incoming"
@@ -263,15 +264,30 @@ def process_request_file(file_path):
             
             # Make the request
             try:
-                response = urllib.request.urlopen(req, data=data, context=context, timeout=30)
-                
-                # Read response data
-                response_body = response.read()
-                response_code = response.status
-                response_headers = {}
-                
-                for header, value in response.getheaders():
-                    response_headers[header] = value
+                try:
+                    response = urllib.request.urlopen(req, data=data, context=context, timeout=30)
+                    
+                    # Read response data
+                    response_body = response.read()
+                    response_code = response.status
+                    response_headers = {}
+                    
+                    for header, value in response.getheaders():
+                        response_headers[header] = value
+                        
+                except urllib.error.HTTPError as http_err:
+                    # Handle HTTP errors including 304 Not Modified
+                    response_code = http_err.code
+                    response_headers = dict(http_err.headers.items())
+                    
+                    # For 304 Not Modified, we don't need body content
+                    if response_code == 304:
+                        response_body = b''
+                        print(f"Handling 304 Not Modified response for {url}")
+                    else:
+                        # For other errors, get the error body
+                        response_body = http_err.read()
+                        print(f"HTTP Error {response_code} for {url}: {http_err}")
                 
                 # Check if response is binary
                 is_binary = likely_binary  # Start with the request hint
@@ -283,6 +299,9 @@ def process_request_file(file_path):
                     if detected_type:
                         response_headers['Content-Type'] = detected_type
                         content_type = detected_type
+                else:
+                    # Log the actual content type for debugging
+                    print(f"Server returned Content-Type: {content_type} for {url}")
                 
                 # Determine if content is binary based on content type or previous hint
                 if not is_binary and content_type:
@@ -302,6 +321,7 @@ def process_request_file(file_path):
                 if response_code == 304:
                     # 304 responses typically don't have a body
                     content_str = ""
+                    is_binary = False  # Force non-binary for 304
                     print(f"304 Not Modified response for {url}")
                 # Process response body based on binary flag
                 elif is_binary:
@@ -410,10 +430,25 @@ def check_request_files():
 
 def main():
     """Main function to run the handler"""
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description='Windows bridge for file-based proxy')
+    parser.add_argument('--no-cookies', action='store_true', help='Do not load cookies at startup')
+    parser.add_argument('--reset-cookies', action='store_true', help='Reset cookie jar before starting')
+    args = parser.parse_args()
+    
     print(f"Starting Windows mitmproxy bridge handler at {datetime.datetime.now()}")
     
-    # Load any stored cookies
-    load_cookies()
+    # Handle cookie options
+    if args.reset_cookies:
+        global COOKIE_JAR
+        COOKIE_JAR = {}
+        print("Cookie jar has been reset")
+        save_cookies()  # Save empty cookie jar to file
+    elif not args.no_cookies:
+        # Load any stored cookies if not disabled
+        load_cookies()
+    else:
+        print("Starting with empty cookie jar (--no-cookies specified)")
     
     polling_interval = 1  # seconds
     
