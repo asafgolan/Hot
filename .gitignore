@@ -8,3 +8,4 @@ __pycache__
 tv/samsung/.DS_Store
 test_results
 infra/proxy/ssh_transfer
+infra/proxy/proxy_debug.log
