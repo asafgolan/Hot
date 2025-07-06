@@ -57,6 +57,7 @@ auth_manager = None
 
 # Constants - ALWAYS use raw file strategy  
 RAW_CONTENT_THRESHOLD = 6291456  # 6MB - handle large CSS/JS files inline for better performance
+SMALL_ASSET_THRESHOLD = 10240  # 10KB - embed small assets inline for speed
 BATCH_SIZE = 50  # Process multiple files in batches (increased for browser-like speed)
 CONCURRENT_TRANSFERS = 8  # Number of concurrent SSH transfers (doubled)
 MAX_WORKER_THREADS = 12  # Maximum concurrent request processors (doubled)
@@ -435,21 +436,32 @@ def cleanup_mac_request_files_batch(filenames):
         print(f"Error in fast cleanup: {e}")
 
 def upload_response_file(local_file, filename):
-    """Windows-compatible upload response file to Mac with atomic operations"""
+    """Windows-compatible upload response file to Mac with optimized transfers"""
     try:
-        # Use atomic file operations to prevent race conditions
-        temp_filename = f"{filename}.tmp"
-        temp_remote_path = f"{MAC_INCOMING}/{temp_filename}"
-        final_remote_path = f"{MAC_INCOMING}/{filename}"
+        # Fast path for small response files - skip atomic operations for speed
+        file_size = os.path.getsize(local_file)
+        use_atomic = file_size > 50000  # Only use atomic for files > 50KB
         
-        # Step 1: Upload to temporary file first
+        if use_atomic:
+            # Use atomic file operations to prevent race conditions for large files
+            temp_filename = f"{filename}.tmp"
+            temp_remote_path = f"{MAC_INCOMING}/{temp_filename}"
+            final_remote_path = f"{MAC_INCOMING}/{filename}"
+            target_path = temp_remote_path
+        else:
+            # Direct upload for small files
+            final_remote_path = f"{MAC_INCOMING}/{filename}"
+            target_path = final_remote_path
+        
+        # Step 1: Upload file
         scp_cmd = ['scp', '-q']
         if MAC_SSH_CONFIG.get('key_file'):
             scp_cmd.extend(['-i', MAC_SSH_CONFIG['key_file']])
         
-        # Windows-compatible options only
+        # Windows-compatible options - faster timeouts for small files
+        connect_timeout = 10 if use_atomic else 5
         scp_cmd.extend([
-            '-o', 'ConnectTimeout=10',
+            '-o', f'ConnectTimeout={connect_timeout}',
             '-o', 'StrictHostKeyChecking=no',
             '-o', 'BatchMode=yes'
         ])
@@ -459,25 +471,31 @@ def upload_response_file(local_file, filename):
             
         scp_cmd.extend([
             local_file,
-            f"{MAC_SSH_CONFIG['user']}@{MAC_SSH_CONFIG['host']}:{temp_remote_path}"
+            f"{MAC_SSH_CONFIG['user']}@{MAC_SSH_CONFIG['host']}:{target_path}"
         ])
         
-        result = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=30)
+        # Shorter timeout for small files
+        timeout = 30 if use_atomic else 10
+        result = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=timeout)
         
         if result.returncode == 0:
-            # Step 2: Atomically rename to final name
-            ssh_cmd = build_ssh_cmd(f"mv {temp_remote_path} {final_remote_path}", is_command=True)
-            rename_result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=10)
-            
-            if rename_result.returncode == 0:
-                print(f"Uploaded response file to Mac (atomic): {filename}")
-                return True
+            if use_atomic:
+                # Step 2: Atomically rename to final name for large files
+                ssh_cmd = build_ssh_cmd(f"mv {temp_remote_path} {final_remote_path}", is_command=True)
+                rename_result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=5)
+                
+                if rename_result.returncode == 0:
+                    print(f"Uploaded response file to Mac (atomic): {filename}")
+                    return True
+                else:
+                    print(f"Failed to rename uploaded file: {rename_result.stderr}")
+                    # Clean up temp file
+                    cleanup_cmd = build_ssh_cmd(f"rm -f {temp_remote_path}", is_command=True)
+                    subprocess.run(cleanup_cmd, capture_output=True, text=True, timeout=5)
+                    return False
             else:
-                print(f"Failed to rename uploaded file: {rename_result.stderr}")
-                # Clean up temp file
-                cleanup_cmd = build_ssh_cmd(f"rm -f {temp_remote_path}", is_command=True)
-                subprocess.run(cleanup_cmd, capture_output=True, text=True, timeout=5)
-                return False
+                print(f"Uploaded response file to Mac (direct): {filename} ({file_size} bytes)")
+                return True
         else:
             print(f"Failed to upload response file: {result.stderr}")
             return False
@@ -734,9 +752,20 @@ def process_request_file(file_path):
             
             print(f"Content type: {content_type}, Size: {len(response_body)} bytes")
             
-            # ALWAYS use raw file strategy for content > 1KB (everything except tiny responses)
+            # Smart content handling: small static assets inline, large content as raw files
             raw_content_file = None
-            if len(response_body) > RAW_CONTENT_THRESHOLD or response_code != 304:
+            content_size = len(response_body)
+            
+            # Fast path for small static assets (images, CSS, JS under 10KB)
+            use_inline = (content_size <= SMALL_ASSET_THRESHOLD and 
+                         is_resource and 
+                         response_code == 200 and
+                         any(ext in content_type.lower() for ext in ['image/', 'css', 'javascript']))
+            
+            if use_inline:
+                print(f"⚡ FAST PATH: Inlining small {content_type} asset ({content_size} bytes) for speed")
+            
+            if not use_inline and (content_size > 0 and response_code != 304):
                 # Create raw content file with appropriate extension
                 file_extension = 'bin'
                 if 'javascript' in content_type:
@@ -806,8 +835,8 @@ def process_request_file(file_path):
             if (cache_key and response_code == 200 and is_resource and len(response_body) > 0):
                 cache_response(cache_key, response_data.copy())
             
-            # For tiny responses or 304 responses, include content inline
-            if raw_content_file is None and len(response_body) <= RAW_CONTENT_THRESHOLD:
+            # For small static assets, 304 responses, or when using fast inline path
+            if raw_content_file is None and (use_inline or len(response_body) <= SMALL_ASSET_THRESHOLD):
                 try:
                     # Try to include small content as text
                     response_data["content"] = response_body.decode('utf-8')

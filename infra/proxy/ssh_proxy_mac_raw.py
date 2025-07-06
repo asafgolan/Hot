@@ -465,17 +465,21 @@ class RawContentProxyHandler(http.server.BaseHTTPRequestHandler):
         start_time = time.time()
         response_file = os.path.join(LOCAL_INCOMING, f"resp_{request_id}.json")
         
-        # Optimized polling with adaptive intervals
+        # Optimized polling with adaptive intervals - faster for static assets
         poll_count = 0
+        # Static assets get more aggressive polling
+        is_static = self._is_static_asset(url)
+        base_interval = FILE_POLL_INTERVAL * 0.5 if is_static else FILE_POLL_INTERVAL
+        
         while not os.path.exists(response_file) and (time.time() - start_time < timeout):
             poll_count += 1
             # Ultra-aggressive adaptive polling for browser-like speed
-            if poll_count < 200:  # First 10 seconds (200 * 0.05 = 10s)
-                time.sleep(FILE_POLL_INTERVAL)  # 50ms polling
+            if poll_count < 200:  # First 10 seconds 
+                time.sleep(base_interval)  # 25ms for static assets, 50ms for others
             elif poll_count < 300:  # Next 5 seconds
-                time.sleep(0.1)  # 100ms polling
+                time.sleep(0.05 if is_static else 0.1)  # 50ms for static, 100ms for others
             else:  # After 15 seconds
-                time.sleep(0.2)  # 200ms polling
+                time.sleep(0.1 if is_static else 0.2)  # 100ms for static, 200ms for others
         
         if os.path.exists(response_file):
             try:
