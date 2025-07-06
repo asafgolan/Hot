@@ -720,15 +720,20 @@ def process_request_file(file_path):
                     response_body = b''
                     print(f"Handling 304 Not Modified response for {url}")
                 else:
-                    response_body = http_err.read()
+                    response_body = http_err.read() or b''
                     print(f"HTTP Error {response_code} for {url}")
             else:
                 # Read response body
-                response_body = response.read()
+                response_body = response.read() or b''
             
             # Extract cookies from response
             extract_cookies_from_headers(response_headers, domain)
             save_cookies()
+            
+            # Ensure response_body is never None
+            if response_body is None:
+                response_body = b''
+                print(f"Warning: Got None response_body for {url}, using empty bytes")
             
             # Determine content type first
             content_type = response_headers.get('Content-Type', '')
@@ -954,7 +959,8 @@ def check_request_files_parallel():
             except:
                 return REQUEST_PRIORITIES['other']
         
-        # Sort by priority (lower number = higher priority)
+        # Sort by priority (lower number = higher priority) - ensure no None files
+        synced_files = [f for f in synced_files if f]  # Filter out any None/empty filenames
         synced_files_prioritized = sorted(synced_files, key=get_file_priority)
         
         # Process files in parallel using thread pool with aggressive batching
