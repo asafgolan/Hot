@@ -57,10 +57,10 @@ auth_manager = None
 
 # Constants - ALWAYS use raw file strategy  
 RAW_CONTENT_THRESHOLD = 6291456  # 6MB - handle large CSS/JS files inline for better performance
-BATCH_SIZE = 20  # Process multiple files in batches
-CONCURRENT_TRANSFERS = 4  # Number of concurrent SSH transfers
-MAX_WORKER_THREADS = 6  # Maximum concurrent request processors
-SSH_CONNECTION_POOL_SIZE = 3  # Persistent SSH connections
+BATCH_SIZE = 50  # Process multiple files in batches (increased for browser-like speed)
+CONCURRENT_TRANSFERS = 8  # Number of concurrent SSH transfers (doubled)
+MAX_WORKER_THREADS = 12  # Maximum concurrent request processors (doubled)
+SSH_CONNECTION_POOL_SIZE = 6  # Persistent SSH connections (doubled)
 
 # Browser-like request prioritization
 REQUEST_PRIORITIES = {
@@ -928,21 +928,56 @@ def check_request_files_parallel():
         # Sort by priority (lower number = higher priority)
         synced_files_prioritized = sorted(synced_files, key=get_file_priority)
         
-        # Process files in parallel using thread pool
+        # Process files in parallel using thread pool with aggressive batching
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKER_THREADS) as executor:
-            # Submit high-priority files first
-            future_to_file = {executor.submit(process_request_async, req_file): req_file 
-                            for req_file in synced_files_prioritized}
+            # Split into priority groups for better browser-like loading
+            high_priority = [f for f in synced_files_prioritized if get_file_priority(f) <= 2]  # HTML, CSS
+            medium_priority = [f for f in synced_files_prioritized if 3 <= get_file_priority(f) <= 4]  # JS, Fonts
+            low_priority = [f for f in synced_files_prioritized if get_file_priority(f) > 4]  # Images, other
             
             processed_files = []
-            for future in concurrent.futures.as_completed(future_to_file, timeout=60):
-                req_file = future_to_file[future]
-                try:
-                    success = future.result()
-                    if success:
-                        processed_files.append(req_file)
-                except Exception as e:
-                    print(f"Error processing {req_file}: {e}")
+            
+            # Process high priority first (like critical rendering path)
+            if high_priority:
+                print(f"⚡ Processing {len(high_priority)} high-priority requests first")
+                future_to_file = {executor.submit(process_request_async, req_file): req_file 
+                                for req_file in high_priority}
+                for future in concurrent.futures.as_completed(future_to_file, timeout=30):
+                    req_file = future_to_file[future]
+                    try:
+                        success = future.result()
+                        if success:
+                            processed_files.append(req_file)
+                    except Exception as e:
+                        print(f"Error processing high-priority {req_file}: {e}")
+            
+            # Process medium priority (JS, fonts)
+            if medium_priority:
+                print(f"⚡ Processing {len(medium_priority)} medium-priority requests")
+                future_to_file = {executor.submit(process_request_async, req_file): req_file 
+                                for req_file in medium_priority}
+                for future in concurrent.futures.as_completed(future_to_file, timeout=45):
+                    req_file = future_to_file[future]
+                    try:
+                        success = future.result()
+                        if success:
+                            processed_files.append(req_file)
+                    except Exception as e:
+                        print(f"Error processing medium-priority {req_file}: {e}")
+            
+            # Process low priority in the background (images can load after)
+            if low_priority:
+                print(f"⚡ Processing {len(low_priority)} low-priority requests in background")
+                future_to_file = {executor.submit(process_request_async, req_file): req_file 
+                                for req_file in low_priority}
+                for future in concurrent.futures.as_completed(future_to_file, timeout=60):
+                    req_file = future_to_file[future]
+                    try:
+                        success = future.result()
+                        if success:
+                            processed_files.append(req_file)
+                    except Exception as e:
+                        print(f"Error processing low-priority {req_file}: {e}")
         
         # Single batch cleanup on Mac
         if processed_files:
@@ -1010,7 +1045,7 @@ def main():
         print(f"❌ SSH connectivity test failed: {e}")
         return
     
-    polling_interval = 0.1  # seconds - ultra-fast polling for browser-like responsiveness
+    polling_interval = 0.05  # seconds - ultra-fast polling for browser-like responsiveness (50ms)
     
     # Initialize connection pool and worker threads
     init_ssh_connection_pool()
@@ -1087,26 +1122,57 @@ def main():
 
 # Background upload queue processor for even better performance
 def upload_queue_processor():
-    """Background thread to handle uploads asynchronously"""
+    """Background thread to handle uploads asynchronously with batching"""
+    batch_queue = []
+    batch_timeout = 0.2  # Wait 200ms to batch uploads
+    last_batch_time = time.time()
+    
     while True:
         try:
-            upload_task = response_upload_queue.get(timeout=1)
-            if upload_task is None:  # Shutdown signal
-                break
-                
-            file_path, filename = upload_task
-            if os.path.exists(file_path):
-                upload_response_file(file_path, filename)
-                try:
-                    os.remove(file_path)
-                except Exception:
-                    pass
+            # Try to get an upload task
+            try:
+                upload_task = response_upload_queue.get(timeout=batch_timeout)
+                if upload_task is None:  # Shutdown signal
+                    # Process any remaining batch
+                    if batch_queue:
+                        process_upload_batch(batch_queue)
+                    break
                     
-            response_upload_queue.task_done()
-        except queue.Empty:
-            continue
+                batch_queue.append(upload_task)
+                response_upload_queue.task_done()
+                
+            except queue.Empty:
+                # No new tasks, process batch if we have items or timeout
+                if batch_queue and (time.time() - last_batch_time) > batch_timeout:
+                    process_upload_batch(batch_queue)
+                    batch_queue = []
+                    last_batch_time = time.time()
+                continue
+            
+            # Process batch if it's getting large or enough time has passed
+            if len(batch_queue) >= 5 or (time.time() - last_batch_time) > batch_timeout:
+                process_upload_batch(batch_queue)
+                batch_queue = []
+                last_batch_time = time.time()
+                
         except Exception as e:
             print(f"Upload queue error: {e}")
+
+def process_upload_batch(batch_queue):
+    """Process a batch of uploads more efficiently"""
+    if not batch_queue:
+        return
+        
+    print(f"⚡ Processing upload batch of {len(batch_queue)} files")
+    
+    # Process all uploads in the batch
+    for file_path, filename in batch_queue:
+        if os.path.exists(file_path):
+            upload_response_file(file_path, filename)
+            try:
+                os.remove(file_path)
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     main()
