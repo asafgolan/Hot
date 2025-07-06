@@ -173,17 +173,14 @@ class RawContentProxyHandler(http.server.BaseHTTPRequestHandler):
         # Let browser handle caching - only intercept if browser explicitly allows caching
         headers = dict(self.headers)
         
-        # Check if browser is asking for cached content (has If-None-Match or If-Modified-Since)
-        has_cache_headers = any(h in headers for h in ['If-None-Match', 'If-Modified-Since'])
-        
-        # Only use Mac cache if browser is making a conditional request
-        if has_cache_headers and self._is_static_asset(url):
+        # Browser-like caching: Check cache for static assets regardless of conditional headers
+        if self._is_static_asset(url):
             static_cache_key = self._get_static_cache_key(method, url, headers)
             if static_cache_key:
                 cached_response = self._get_cached_static_response(static_cache_key)
                 if cached_response:
                     if DEBUG:
-                        print(f"⚡ Mac cache HIT for conditional request: {url}")
+                        print(f"⚡ Mac cache HIT for static asset: {url}")
                     self._send_cached_static_response(cached_response)
                     return
         

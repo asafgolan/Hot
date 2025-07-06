@@ -593,12 +593,32 @@ def process_request_file(file_path):
         body_encoding = request_data.get('body_encoding', 'utf-8')
         is_resource = request_data.get('is_resource', False)
         
-        # Check cache first for GET requests (only if caching is enabled)
+        # Enhanced cache check: Use cache for fresh static assets like a real browser
         cache_key = get_cache_key(url, method, headers, body) if RESPONSE_CACHE is not None else None
-        if cache_key and RESPONSE_CACHE is not None:
+        if cache_key and RESPONSE_CACHE is not None and is_resource:
             cached_response = get_cached_response(cache_key)
             if cached_response:
-                print(f"⚡ Cache HIT for {url}")
+                # Check if browser sent conditional headers indicating it has a cached version
+                if_none_match = headers.get('If-None-Match')
+                if_modified_since = headers.get('If-Modified-Since')
+                
+                # For static assets, serve from cache if still fresh or if browser has conditional headers
+                cache_control = cached_response.get('headers', {}).get('Cache-Control', '')
+                etag = cached_response.get('headers', {}).get('ETag', '')
+                
+                # Browser is checking if content changed (conditional request)
+                if (if_none_match and etag and if_none_match.strip('"') == etag.strip('"')):
+                    print(f"⚡ Cache HIT: 304 Not Modified for {url}")
+                    # Return 304 response
+                    cached_response['status'] = 304
+                    cached_response['content'] = ''
+                    cached_response['content_size'] = 0
+                elif not if_none_match and not if_modified_since:
+                    # Direct cache hit for fresh static assets
+                    print(f"⚡ Cache HIT: Fresh static asset {url}")
+                else:
+                    print(f"⚡ Cache HIT: Standard cache hit for {url}")
+                
                 # Create response file from cache
                 response_file = os.path.join(OUTGOING_DIR, f"resp_{request_id}.json")
                 cached_response['id'] = request_id  # Update request ID
