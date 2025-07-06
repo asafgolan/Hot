@@ -14,6 +14,27 @@ from collections import defaultdict
 class AuthStateManager:
     """Manages complete authentication state for hot.net domains"""
     
+    # Cookies to exclude from auth management (redirect cookies that cause issues)
+    EXCLUDED_COOKIES = {
+        '_cl_30', '_cr_30', '_cl_', '_cr_',  # Redirect cookies
+        'lobbyTofunnel',  # Navigation tracking
+        '_hjSession', '_hjSessionUser',  # Hotjar tracking
+        '_ga', '_gid', '_gat', '_gcl_au',  # Google Analytics
+        '_tt_enable_cookie', '_ttp',  # TikTok tracking
+        'dicbo_id',  # Advertising tracking
+        # Additional redirect-related cookies
+        'redirect_url', 'redirect_to', 'return_url', 'return_to',
+        'next_url', 'continue_url', 'target_url', 'goto_url',
+        '_redirect', '_return', '_next', '_continue', '_target',
+        'back_url', 'orig_url', 'original_url', 'prev_url',
+        # Session state cookies that can cause routing issues
+        'session_state', 'nav_state', 'page_state', 'route_state',
+        'current_page', 'last_page', 'visit_source', 'entry_point',
+        # Hot.net specific cookies that might cause redirects
+        'hot_redirect', 'hot_nav', 'hot_route', 'hot_entry',
+        'user_journey', 'page_flow', 'navigation_flow',
+    }
+    
     def __init__(self, auth_file_path):
         self.auth_file = auth_file_path
         self.auth_data = self.load_auth_state()
@@ -78,6 +99,40 @@ class AuthStateManager:
             return 'hot.net' in domain
         except:
             return False
+    
+    def _should_exclude_cookie(self, cookie_name):
+        """Check if a cookie should be excluded from auth management"""
+        cookie_lower = cookie_name.lower()
+        
+        # Check exact matches first
+        if cookie_name in self.EXCLUDED_COOKIES:
+            print(f"🚫 EXCLUDED: Exact match cookie: {cookie_name}")
+            return True
+            
+        # Check partial matches for tracking cookies
+        for excluded in self.EXCLUDED_COOKIES:
+            if excluded.endswith('_') and cookie_name.startswith(excluded):
+                print(f"🚫 EXCLUDED: Prefix match cookie: {cookie_name} (matches {excluded})")
+                return True
+            elif excluded.startswith('_') and excluded.endswith('_') and excluded[1:-1] in cookie_lower:
+                print(f"🚫 EXCLUDED: Contains match cookie: {cookie_name} (matches {excluded})")
+                return True
+        
+        # Additional pattern-based exclusions for redirect-related cookies
+        redirect_patterns = ['redirect', 'return', 'next', 'continue', 'target', 'goto', 'back', 'orig', 'prev']
+        for pattern in redirect_patterns:
+            if pattern in cookie_lower:
+                print(f"🚫 EXCLUDED: Redirect pattern cookie: {cookie_name} (contains '{pattern}')")
+                return True
+                
+        # Check for navigation/tracking patterns
+        nav_patterns = ['nav', 'route', 'page', 'visit', 'journey', 'flow', 'state']
+        for pattern in nav_patterns:
+            if pattern in cookie_lower and ('_' in cookie_name or len(cookie_name) > 10):
+                print(f"🚫 EXCLUDED: Navigation pattern cookie: {cookie_name} (contains '{pattern}')")
+                return True
+                
+        return False
     
     def extract_domain_key(self, url):
         """Extract domain key for storage"""
@@ -309,7 +364,7 @@ class AuthStateManager:
             print(f"Error extracting from JavaScript: {e}")
     
     def apply_auth_to_headers(self, url, headers):
-        """Apply stored authentication data to outgoing request headers"""
+        """Apply stored authentication data to outgoing request headers (filtered)"""
         if not self.is_hot_net_domain(url):
             return headers
         
@@ -319,10 +374,11 @@ class AuthStateManager:
         
         domain_auth = self.auth_data['domains'][domain_key]
         
-        # Apply stored auth headers
+        # Apply stored auth headers (excluding problematic ones)
         for header_name, header_value in domain_auth.get('headers', {}).items():
-            headers[header_name] = header_value
-            print(f"Applied auth header: {header_name}")
+            if not self._should_exclude_cookie(header_name):
+                headers[header_name] = header_value
+                print(f"Applied auth header: {header_name}")
         
         # Apply tokens as Authorization header if no auth header present
         if 'Authorization' not in headers and 'authorization' not in headers:

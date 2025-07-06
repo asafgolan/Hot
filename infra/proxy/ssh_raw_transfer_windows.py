@@ -126,6 +126,30 @@ def load_cookies():
     # Initialize enhanced auth manager for hot.net domains
     auth_manager = AuthStateManager(AUTH_STATE_FILE)
     print("Enhanced auth manager initialized for hot.net domains")
+    
+    # Clean up existing problematic cookies from jar
+    cleanup_problematic_cookies()
+
+def cleanup_problematic_cookies():
+    """Remove problematic cookies from existing cookie jar"""
+    if not auth_manager:
+        return
+    
+    cleaned_count = 0
+    for domain in list(COOKIE_JAR.keys()):
+        for cookie_name in list(COOKIE_JAR[domain].keys()):
+            if auth_manager._should_exclude_cookie(cookie_name):
+                del COOKIE_JAR[domain][cookie_name]
+                cleaned_count += 1
+                print(f"Cleaned up problematic cookie: {cookie_name} from {domain}")
+        
+        # Remove empty domains
+        if not COOKIE_JAR[domain]:
+            del COOKIE_JAR[domain]
+    
+    if cleaned_count > 0:
+        print(f"🧹 Cleaned up {cleaned_count} problematic cookies from jar")
+        save_cookies()
 
 def save_cookies():
     """Save cookies to disk"""
@@ -137,7 +161,7 @@ def save_cookies():
         print(f"Error saving cookies: {e}")
 
 def extract_cookies_from_headers(headers, domain):
-    """Extract cookies from response headers"""
+    """Extract cookies from response headers (filtered to exclude problematic ones)"""
     if not headers:
         return
         
@@ -155,6 +179,11 @@ def extract_cookies_from_headers(headers, domain):
         if len(cookie_parts) == 2:
             cookie_name, cookie_value = cookie_parts
             
+            # Filter out problematic cookies using auth manager if available
+            if auth_manager and auth_manager._should_exclude_cookie(cookie_name):
+                print(f"Filtered out problematic cookie: {cookie_name} (redirect/tracking)")
+                continue
+            
             # Initialize domain in cookie jar if not present
             if domain not in COOKIE_JAR:
                 COOKIE_JAR[domain] = {}
@@ -164,24 +193,32 @@ def extract_cookies_from_headers(headers, domain):
             print(f"Stored cookie {cookie_name}={cookie_value} for {domain}")
 
 def apply_cookies_to_headers(headers, domain):
-    """Apply cookies from jar to request headers"""
+    """Apply cookies from jar to request headers (filtered)"""
     if domain in COOKIE_JAR and COOKIE_JAR[domain]:
         # Convert headers to case-insensitive dict
         lower_headers = {k.lower(): k for k in headers.keys()}
         
-        # Build cookie string
-        cookie_str = '; '.join([f"{k}={v}" for k, v in COOKIE_JAR[domain].items()])
+        # Build cookie string, filtering out problematic cookies
+        filtered_cookies = []
+        for k, v in COOKIE_JAR[domain].items():
+            if not (auth_manager and auth_manager._should_exclude_cookie(k)):
+                filtered_cookies.append(f"{k}={v}")
+            else:
+                print(f"Filtered out problematic cookie from request: {k}")
         
-        # Check if a cookie header already exists
-        if 'cookie' in lower_headers:
-            # Append to existing cookie
-            original_key = lower_headers['cookie']
-            headers[original_key] = headers[original_key] + '; ' + cookie_str
-        else:
-            # Create new cookie header
-            headers['Cookie'] = cookie_str
+        if filtered_cookies:
+            cookie_str = '; '.join(filtered_cookies)
             
-        print(f"Applied {len(COOKIE_JAR[domain])} cookies to request for {domain}")
+            # Check if a cookie header already exists
+            if 'cookie' in lower_headers:
+                # Append to existing cookie
+                original_key = lower_headers['cookie']
+                headers[original_key] = headers[original_key] + '; ' + cookie_str
+            else:
+                # Create new cookie header
+                headers['Cookie'] = cookie_str
+                
+            print(f"Applied {len(filtered_cookies)} filtered cookies to request for {domain}")
     return headers
 
 def get_content_type(url):
@@ -599,15 +636,28 @@ def cache_response(cache_key, response_data):
 def process_request_file(file_path):
     """Ultra-fast request processing with caching and optimizations"""
     try:
-        # Read the request data
+        # Read the request data with error handling
         with open(file_path, 'r', encoding='utf-8') as f:
             request_data = json.load(f)
+        
+        # Defensive checks for required fields
+        if not request_data:
+            print(f"Error: Empty request data in {file_path}")
+            return False
             
         request_id = request_data.get('id')
+        if not request_id:
+            print(f"Error: Missing request ID in {file_path}")
+            return False
+            
         url = request_data.get('url', '')
+        if not url:
+            print(f"Error: Missing URL in {file_path}")
+            return False
+            
         method = request_data.get('method', 'GET')
-        headers = request_data.get('headers', {})
-        body = request_data.get('body', '')
+        headers = request_data.get('headers', {}) or {}  # Ensure not None
+        body = request_data.get('body', '') or ''  # Ensure not None
         body_encoding = request_data.get('body_encoding', 'utf-8')
         is_resource = request_data.get('is_resource', False)
         
@@ -656,8 +706,18 @@ def process_request_file(file_path):
         
         print(f"Processing request: {url} (Resource: {is_resource})")
         
-        # Extract domain
-        domain = url.split('://', 1)[-1].split('/', 1)[0] if '://' in url else url.split('/', 1)[0]
+        # Debug: Check if this URL might cause redirect issues
+        if any(pattern in url.lower() for pattern in ['/auth', '/login', '/signin', '/redirect']):
+            print(f"⚠️ POTENTIAL REDIRECT URL: {url} (contains auth/login/redirect pattern)")
+        
+        # Extract domain with error handling
+        try:
+            domain = url.split('://', 1)[-1].split('/', 1)[0] if '://' in url else url.split('/', 1)[0]
+            if not domain:
+                domain = 'unknown'
+        except Exception as e:
+            print(f"Error extracting domain from URL '{url}': {e}")
+            domain = 'unknown'
         
         # Apply cookies to request headers
         headers = apply_cookies_to_headers(headers, domain)
@@ -725,6 +785,15 @@ def process_request_file(file_path):
             else:
                 # Read response body
                 response_body = response.read() or b''
+            
+            # Check for redirect responses first (before extracting cookies)
+            if response_code in [301, 302, 303, 307, 308]:
+                location = response_headers.get('Location', '')
+                print(f"🔄 REDIRECT DETECTED: {response_code} to {location}")
+                
+                # Check if this is a problematic redirect back to home
+                if location and any(pattern in location.lower() for pattern in ['home', 'index', 'main', 'lobby']):
+                    print(f"⚠️ PROBLEMATIC REDIRECT: {url} -> {location} (likely home page redirect)")
             
             # Extract cookies from response
             extract_cookies_from_headers(response_headers, domain)
@@ -934,6 +1003,8 @@ def process_request_async(req_file):
         return success
     except Exception as e:
         print(f"Error processing {req_file}: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 def check_request_files_parallel():
