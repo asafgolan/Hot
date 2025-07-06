@@ -7,7 +7,9 @@ import json
 import re
 import os
 import time
+import threading
 from urllib.parse import urlparse
+from collections import defaultdict
 
 class AuthStateManager:
     """Manages complete authentication state for hot.net domains"""
@@ -15,6 +17,10 @@ class AuthStateManager:
     def __init__(self, auth_file_path):
         self.auth_file = auth_file_path
         self.auth_data = self.load_auth_state()
+        self._lock = threading.RLock()  # Thread-safe operations
+        self._save_pending = False
+        self._last_save = 0
+        self._min_save_interval = 5  # Minimum seconds between saves
     
     def load_auth_state(self):
         """Load existing authentication state"""
@@ -30,23 +36,39 @@ class AuthStateManager:
             'last_updated': None
         }
     
-    def save_auth_state(self):
-        """Save authentication state to disk"""
-        try:
-            self.auth_data['last_updated'] = int(time.time())
+    def save_auth_state(self, force=False):
+        """Optimized save authentication state to disk with throttling"""
+        with self._lock:
+            current_time = time.time()
             
-            # Ensure directory exists
-            os.makedirs(os.path.dirname(self.auth_file), exist_ok=True)
+            # Throttle saves to avoid excessive disk I/O
+            if not force and (current_time - self._last_save) < self._min_save_interval:
+                self._save_pending = True
+                return True
             
-            with open(self.auth_file, 'w', encoding='utf-8') as f:
-                json.dump(self.auth_data, f, indent=2, ensure_ascii=False)
-            
-            print(f"Auth state saved with {len(self.auth_data['domains'])} domains")
-            return True
-            
-        except Exception as e:
-            print(f"Error saving auth state: {e}")
-            return False
+            try:
+                self.auth_data['last_updated'] = int(current_time)
+                
+                # Ensure directory exists
+                os.makedirs(os.path.dirname(self.auth_file), exist_ok=True)
+                
+                # Atomic write for safety
+                temp_file = f"{self.auth_file}.tmp"
+                with open(temp_file, 'w', encoding='utf-8') as f:
+                    json.dump(self.auth_data, f, indent=2, ensure_ascii=False)
+                
+                # Atomic rename
+                os.rename(temp_file, self.auth_file)
+                
+                self._last_save = current_time
+                self._save_pending = False
+                
+                print(f"Auth state saved with {len(self.auth_data['domains'])} domains")
+                return True
+                
+            except Exception as e:
+                print(f"Error saving auth state: {e}")
+                return False
     
     def is_hot_net_domain(self, url):
         """Check if URL belongs to hot.net domains"""
@@ -349,3 +371,27 @@ class AuthStateManager:
             }
         
         return summary
+    
+    def cleanup_old_auth_data(self, max_age_days=30):
+        """Clean up old authentication data to prevent memory bloat"""
+        with self._lock:
+            current_time = time.time()
+            cutoff_time = current_time - (max_age_days * 24 * 3600)
+            
+            domains_to_remove = []
+            for domain, auth_data in self.auth_data.get('domains', {}).items():
+                last_updated = auth_data.get('last_updated', 0)
+                if last_updated < cutoff_time:
+                    domains_to_remove.append(domain)
+            
+            for domain in domains_to_remove:
+                del self.auth_data['domains'][domain]
+            
+            if domains_to_remove:
+                print(f"Cleaned up {len(domains_to_remove)} old auth domains")
+                self.save_auth_state(force=True)
+    
+    def force_save(self):
+        """Force save pending changes"""
+        if self._save_pending:
+            self.save_auth_state(force=True)

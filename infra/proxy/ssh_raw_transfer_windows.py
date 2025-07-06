@@ -15,6 +15,9 @@ import urllib.request
 import urllib.error
 import ssl
 import datetime
+import threading
+import queue
+import concurrent.futures
 from auth_state_manager import AuthStateManager
 
 # SSH Configuration for Mac connection
@@ -23,6 +26,8 @@ MAC_SSH_CONFIG = {
     'user': 'macuser',   # Mac username
     'remote_base': '/Users/macuser/Hot/infra/proxy/ssh_transfer',  # Mac base directory
     'key_file': None,    # SSH key file path (optional)
+    'connection_pool_size': 5,  # Number of persistent connections
+    'compression': True,  # Enable SSH compression
 }
 
 # Local Windows directories
@@ -41,16 +46,70 @@ MAC_RAW_CONTENT = f"{MAC_SSH_CONFIG['remote_base']}/raw_content"  # Raw content 
 COOKIE_FILE = os.path.join(CACHE_DIR, "cookies.json")
 COOKIE_JAR = {}
 
+# Response caching for better performance
+RESPONSE_CACHE = {}
+CACHE_MAX_SIZE = 100
+CACHE_MAX_AGE = 300  # 5 minutes
+
 # Enhanced authentication management for hot.net domains
 AUTH_STATE_FILE = os.path.join(CACHE_DIR, "auth_state.json")
 auth_manager = None
 
-# Constants - ALWAYS use raw file strategy
-RAW_CONTENT_THRESHOLD = 1024  # 1KB - nearly everything goes to raw files
+# Constants - ALWAYS use raw file strategy  
+RAW_CONTENT_THRESHOLD = 6291456  # 6MB - handle large CSS/JS files inline for better performance
+BATCH_SIZE = 20  # Process multiple files in batches
+CONCURRENT_TRANSFERS = 4  # Number of concurrent SSH transfers
+MAX_WORKER_THREADS = 6  # Maximum concurrent request processors
+SSH_CONNECTION_POOL_SIZE = 3  # Persistent SSH connections
+
+# Browser-like request prioritization
+REQUEST_PRIORITIES = {
+    'html': 1,      # Highest priority - HTML documents
+    'css': 2,       # High priority - CSS for rendering
+    'js': 3,        # Medium-high priority - JavaScript
+    'font': 4,      # Medium priority - Fonts
+    'image': 5,     # Lower priority - Images
+    'other': 6      # Lowest priority - Other resources
+}
+
+# Resource type detection patterns
+RESOURCE_PATTERNS = {
+    'html': ['.html', '.htm', '.php', '.asp', '.jsp'],
+    'css': ['.css'],
+    'js': ['.js', '.mjs', '.ts', '.jsx', '.tsx'],
+    'font': ['.woff', '.woff2', '.ttf', '.otf', '.eot'],
+    'image': ['.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.ico', '.bmp']
+}
+
+# Global connection pool and processing queues
+ssh_connection_pool = queue.Queue(maxsize=SSH_CONNECTION_POOL_SIZE)
+request_processing_queue = queue.Queue(maxsize=50)
+response_upload_queue = queue.Queue(maxsize=50)
+processing_executor = None
 
 # Ensure directories exist
 for directory in [INCOMING_DIR, OUTGOING_DIR, CACHE_DIR, RAW_CONTENT_DIR]:
     os.makedirs(directory, exist_ok=True)
+
+# Initialize connection pool
+def init_ssh_connection_pool():
+    """Initialize SSH connection pool for reuse"""
+    for _ in range(SSH_CONNECTION_POOL_SIZE):
+        ssh_connection_pool.put(None)  # Will be created on first use
+
+def get_ssh_connection():
+    """Get an SSH connection from the pool (placeholder for now)"""
+    try:
+        return ssh_connection_pool.get_nowait()
+    except queue.Empty:
+        return None
+
+def return_ssh_connection(conn):
+    """Return an SSH connection to the pool"""
+    try:
+        ssh_connection_pool.put_nowait(conn)
+    except queue.Full:
+        pass  # Pool is full, discard connection
 
 def load_cookies():
     """Load cookies from disk if available"""
@@ -155,89 +214,188 @@ def get_content_type(url):
             return 'application/octet-stream'
     return content_type
 
-def add_browser_headers(headers):
-    """Add realistic browser headers for proper web traffic emulation"""
-    browser_headers = {
+def get_resource_type(url):
+    """Determine resource type for prioritization"""
+    url_lower = url.lower()
+    
+    # Check for query parameters and fragments
+    base_url = url_lower.split('?')[0].split('#')[0]
+    
+    for resource_type, patterns in RESOURCE_PATTERNS.items():
+        if any(base_url.endswith(pattern) for pattern in patterns):
+            return resource_type
+    
+    # Content-based detection for URLs without clear extensions
+    if any(keyword in base_url for keyword in ['api', 'ajax', 'json']):
+        return 'js'  # Treat API calls like JS
+    elif any(keyword in base_url for keyword in ['style', 'theme']):
+        return 'css'
+    elif any(keyword in base_url for keyword in ['img', 'image', 'photo', 'pic']):
+        return 'image'
+    
+    return 'other'
+
+def get_request_priority(url):
+    """Get browser-like priority for request"""
+    resource_type = get_resource_type(url)
+    return REQUEST_PRIORITIES.get(resource_type, REQUEST_PRIORITIES['other'])
+
+def add_browser_headers(headers, url, is_resource):
+    """Add realistic browser headers optimized for caching and performance"""
+    # Base browser headers
+    base_headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
         'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
-        'Sec-Fetch-User': '?1',
-        'Upgrade-Insecure-Requests': '1'
+        'Accept-Encoding': 'gzip, deflate, br, zstd',  # Support modern compression
     }
     
-    # Add browser headers if not present
-    for header, value in browser_headers.items():
+    # Resource-specific headers for better caching
+    if is_resource:
+        if url.endswith(('.css', '.js')):
+            # CSS/JS files - allow browser caching
+            base_headers.update({
+                'Accept': 'text/css,*/*;q=0.1' if url.endswith('.css') else 'application/javascript,*/*;q=0.8',
+                'Sec-Fetch-Dest': 'style' if url.endswith('.css') else 'script',
+                'Sec-Fetch-Mode': 'no-cors',
+                'Sec-Fetch-Site': 'same-origin',
+                'Cache-Control': 'max-age=3600'  # Allow 1 hour cache
+            })
+        elif url.endswith(('.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico')):
+            # Images - strong caching
+            base_headers.update({
+                'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+                'Sec-Fetch-Dest': 'image',
+                'Sec-Fetch-Mode': 'no-cors',
+                'Sec-Fetch-Site': 'same-origin',
+                'Cache-Control': 'max-age=86400'  # Allow 24 hour cache
+            })
+        elif url.endswith(('.woff', '.woff2', '.ttf', '.eot')):
+            # Fonts - very strong caching
+            base_headers.update({
+                'Accept': 'font/woff2,font/woff,*/*;q=0.1',
+                'Sec-Fetch-Dest': 'font',
+                'Sec-Fetch-Mode': 'cors',
+                'Sec-Fetch-Site': 'same-origin',
+                'Cache-Control': 'max-age=604800'  # Allow 1 week cache
+            })
+        else:
+            # Other resources
+            base_headers.update({
+                'Accept': '*/*',
+                'Sec-Fetch-Dest': 'empty',
+                'Sec-Fetch-Mode': 'cors',
+                'Sec-Fetch-Site': 'same-origin'
+            })
+    else:
+        # HTML documents - minimal caching
+        base_headers.update({
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Upgrade-Insecure-Requests': '1'
+        })
+    
+    # Add headers if not present
+    for header, value in base_headers.items():
         if header not in headers:
             headers[header] = value
     
     return headers
 
-def build_ssh_cmd(remote_path_or_cmd, is_command=False):
-    """Build SSH/SCP command"""
+def build_ssh_cmd(remote_path_or_cmd, is_command=False, use_compression=True):
+    """Build Windows-compatible SSH/SCP command with basic optimizations"""
     if is_command:
         # SSH command
         cmd = ['ssh']
         if MAC_SSH_CONFIG.get('key_file'):
             cmd.extend(['-i', MAC_SSH_CONFIG['key_file']])
+        
+        # Windows-compatible SSH options (avoiding ControlMaster which causes issues)
         cmd.extend([
-            '-o', 'ConnectTimeout=10',
+            '-o', 'ConnectTimeout=10',  # More conservative timeout for Windows
             '-o', 'StrictHostKeyChecking=no',
-            f"{MAC_SSH_CONFIG['user']}@{MAC_SSH_CONFIG['host']}"
+            '-o', 'BatchMode=yes'  # Non-interactive
         ])
+        
+        # Only add compression if supported and requested
+        if use_compression and MAC_SSH_CONFIG.get('compression', True):
+            cmd.extend(['-o', 'Compression=yes'])
+            
+        cmd.extend([f"{MAC_SSH_CONFIG['user']}@{MAC_SSH_CONFIG['host']}"])
         cmd.append(remote_path_or_cmd)
     else:
-        # SCP command
+        # SCP command - keep it simple for Windows compatibility
         cmd = ['scp', '-r', '-q']
         if MAC_SSH_CONFIG.get('key_file'):
             cmd.extend(['-i', MAC_SSH_CONFIG['key_file']])
+        
+        # Windows-compatible SCP options
         cmd.extend([
             '-o', 'ConnectTimeout=10',
-            '-o', 'StrictHostKeyChecking=no'
+            '-o', 'StrictHostKeyChecking=no',
+            '-o', 'BatchMode=yes'
         ])
+        
+        if use_compression and MAC_SSH_CONFIG.get('compression', True):
+            cmd.extend(['-o', 'Compression=yes'])
+            
         # Add source and destination
         cmd.extend([f"{MAC_SSH_CONFIG['user']}@{MAC_SSH_CONFIG['host']}:{remote_path_or_cmd}", "."])
     
     return cmd
 
-def sync_request_files():
-    """Sync request files from Mac to local incoming directory"""
+def sync_request_files_fast():
+    """Ultra-fast request file sync with minimal SSH calls"""
     try:
+        # Single SSH command to list and count files in one go
+        ssh_cmd = build_ssh_cmd(f"cd {MAC_OUTGOING} && ls req_*.json 2>/dev/null || echo 'NOFILES'", is_command=True)
+        result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=5)
+        
+        if result.returncode != 0 or 'NOFILES' in result.stdout:
+            return []  # No files to sync
+        
+        file_list = [f.strip() for f in result.stdout.strip().split('\n') if f.strip()]
+        if not file_list:
+            return []
+        
+        print(f"Found {len(file_list)} request files on Mac")
+        
         # Change to incoming directory for SCP
         original_dir = os.getcwd()
         os.chdir(INCOMING_DIR)
         
         try:
-            # Use SCP to copy all request files from Mac
-            scp_cmd = build_ssh_cmd(f"{MAC_OUTGOING}/req_*.json", is_command=False)
+            # Use single SCP command to get all files at once
+            if len(file_list) == 1:
+                scp_cmd = build_ssh_cmd(f"{MAC_OUTGOING}/{file_list[0]}", is_command=False)
+            else:
+                # Multiple files - use pattern or multiple file spec
+                file_spec = f"{MAC_OUTGOING}/req_*.json"
+                scp_cmd = build_ssh_cmd(file_spec, is_command=False)
             
-            result = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=30)
+            result = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=15)
             
             if result.returncode == 0:
-                # Count files we got
-                request_files = [f for f in os.listdir('.') if f.startswith("req_") and f.endswith(".json")]
-                if request_files:
-                    print(f"Synced {len(request_files)} request files from Mac")
-                    return request_files
+                # Verify what we actually got
+                local_files = [f for f in os.listdir('.') if f.startswith("req_") and f.endswith(".json")]
+                if local_files:
+                    print(f"⚡ Fast-synced {len(local_files)} request files from Mac")
+                    return local_files
                 else:
                     return []
             else:
-                # SCP failed, might be no files (which is normal)
-                if "No such file" in result.stderr:
-                    return []  # No request files available
-                else:
-                    print(f"SCP sync failed: {result.stderr}")
-                    return []
+                if "No such file" not in result.stderr:
+                    print(f"Fast sync failed: {result.stderr}")
+                return []
         finally:
             os.chdir(original_dir)
             
     except Exception as e:
-        print(f"Error syncing request files: {e}")
+        print(f"Error in fast sync: {e}")
         return []
 
 def cleanup_mac_request_file(filename):
@@ -246,33 +404,80 @@ def cleanup_mac_request_file(filename):
         remote_file = f"{MAC_OUTGOING}/{filename}"
         ssh_cmd = build_ssh_cmd(f"rm -f {remote_file}", is_command=True)
         
-        subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=10)
+        subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=5)
         print(f"Cleaned up request file on Mac: {filename}")
         
     except Exception as e:
         print(f"Error cleaning up Mac request file {filename}: {e}")
 
-def upload_response_file(local_file, filename):
-    """Upload response file to Mac"""
+def cleanup_mac_request_files_batch(filenames):
+    """Ultra-fast batch cleanup using single SSH command"""
     try:
-        remote_path = f"{MAC_INCOMING}/{filename}"
+        if not filenames:
+            return
+            
+        # Ultra-efficient: cd to directory and remove files in one command
+        file_list = ' '.join(filenames)  # Just filenames, not full paths
+        ssh_cmd = build_ssh_cmd(f"cd {MAC_OUTGOING} && rm -f {file_list}", is_command=True)
         
-        # Use SCP to upload file
+        result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            print(f"⚡ Fast cleanup: removed {len(filenames)} files from Mac")
+        else:
+            print(f"Batch cleanup failed: {result.stderr}")
+            # Fallback to pattern-based cleanup
+            if len(filenames) > 5:
+                # Use pattern for many files
+                ssh_cmd = build_ssh_cmd(f"cd {MAC_OUTGOING} && rm -f req_*.json", is_command=True)
+                subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=5)
+        
+    except Exception as e:
+        print(f"Error in fast cleanup: {e}")
+
+def upload_response_file(local_file, filename):
+    """Windows-compatible upload response file to Mac with atomic operations"""
+    try:
+        # Use atomic file operations to prevent race conditions
+        temp_filename = f"{filename}.tmp"
+        temp_remote_path = f"{MAC_INCOMING}/{temp_filename}"
+        final_remote_path = f"{MAC_INCOMING}/{filename}"
+        
+        # Step 1: Upload to temporary file first
         scp_cmd = ['scp', '-q']
         if MAC_SSH_CONFIG.get('key_file'):
             scp_cmd.extend(['-i', MAC_SSH_CONFIG['key_file']])
+        
+        # Windows-compatible options only
         scp_cmd.extend([
             '-o', 'ConnectTimeout=10',
             '-o', 'StrictHostKeyChecking=no',
+            '-o', 'BatchMode=yes'
+        ])
+        
+        if MAC_SSH_CONFIG.get('compression', True):
+            scp_cmd.extend(['-o', 'Compression=yes'])
+            
+        scp_cmd.extend([
             local_file,
-            f"{MAC_SSH_CONFIG['user']}@{MAC_SSH_CONFIG['host']}:{remote_path}"
+            f"{MAC_SSH_CONFIG['user']}@{MAC_SSH_CONFIG['host']}:{temp_remote_path}"
         ])
         
         result = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=30)
         
         if result.returncode == 0:
-            print(f"Uploaded response file to Mac: {filename}")
-            return True
+            # Step 2: Atomically rename to final name
+            ssh_cmd = build_ssh_cmd(f"mv {temp_remote_path} {final_remote_path}", is_command=True)
+            rename_result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=10)
+            
+            if rename_result.returncode == 0:
+                print(f"Uploaded response file to Mac (atomic): {filename}")
+                return True
+            else:
+                print(f"Failed to rename uploaded file: {rename_result.stderr}")
+                # Clean up temp file
+                cleanup_cmd = build_ssh_cmd(f"rm -f {temp_remote_path}", is_command=True)
+                subprocess.run(cleanup_cmd, capture_output=True, text=True, timeout=5)
+                return False
         else:
             print(f"Failed to upload response file: {result.stderr}")
             return False
@@ -282,25 +487,42 @@ def upload_response_file(local_file, filename):
         return False
 
 def upload_raw_content_file(local_file, filename):
-    """Upload raw content file to Mac"""
+    """Windows-compatible upload raw content file to Mac with smart compression"""
     try:
         remote_path = f"{MAC_RAW_CONTENT}/{filename}"
         
-        # Use SCP to upload raw content file
+        # Check file size for optimization decisions
+        file_size = os.path.getsize(local_file)
+        use_compression = file_size > 10240  # Use compression for files > 10KB
+        
+        # Use Windows-compatible SCP to upload raw content file
         scp_cmd = ['scp', '-q']
         if MAC_SSH_CONFIG.get('key_file'):
             scp_cmd.extend(['-i', MAC_SSH_CONFIG['key_file']])
+        
+        # Windows-compatible options only
         scp_cmd.extend([
-            '-o', 'ConnectTimeout=10',
+            '-o', 'ConnectTimeout=15',  # Longer timeout for large files
             '-o', 'StrictHostKeyChecking=no',
+            '-o', 'BatchMode=yes'
+        ])
+        
+        # Conditional compression based on file size
+        if use_compression and MAC_SSH_CONFIG.get('compression', True):
+            scp_cmd.extend(['-o', 'Compression=yes'])
+            
+        scp_cmd.extend([
             local_file,
             f"{MAC_SSH_CONFIG['user']}@{MAC_SSH_CONFIG['host']}:{remote_path}"
         ])
         
-        result = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=60)
+        # Adjusted timeout based on file size
+        timeout = min(max(file_size // 1024 + 15, 30), 180)  # 15-180 seconds based on size
+        
+        result = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=timeout)
         
         if result.returncode == 0:
-            print(f"Uploaded raw content file to Mac: {filename}")
+            print(f"Uploaded raw content file to Mac: {filename} ({file_size} bytes)")
             return True
         else:
             print(f"Failed to upload raw content file: {result.stderr}")
@@ -310,8 +532,54 @@ def upload_raw_content_file(local_file, filename):
         print(f"Error uploading raw content file {filename}: {e}")
         return False
 
+def get_cache_key(url, method, headers, body):
+    """Generate cache key for request"""
+    # Simple cache key based on URL and method for GET requests
+    if method == 'GET' and not body:
+        return f"{method}:{url}"
+    return None  # Don't cache POST requests or requests with body
+
+def get_cached_response(cache_key):
+    """Get cached response if available and not expired"""
+    if cache_key in RESPONSE_CACHE:
+        cached = RESPONSE_CACHE[cache_key]
+        if time.time() - cached['timestamp'] < CACHE_MAX_AGE:
+            # Verify cached response is complete and valid
+            cached_data = cached['data']
+            if (cached_data.get('status') == 200 and 
+                ('content' in cached_data or 'raw_content_file' in cached_data)):
+                return cached_data
+            else:
+                # Remove invalid cache entry
+                del RESPONSE_CACHE[cache_key]
+        else:
+            # Remove expired cache entry
+            del RESPONSE_CACHE[cache_key]
+    return None
+
+def cache_response(cache_key, response_data):
+    """Cache response data only if it's complete and successful"""
+    if (cache_key and 
+        response_data.get('status') == 200 and 
+        (response_data.get('content') or response_data.get('raw_content_file')) and
+        response_data.get('content_size', 0) > 0):
+        
+        # Limit cache size
+        if len(RESPONSE_CACHE) >= CACHE_MAX_SIZE:
+            # Remove oldest entry
+            oldest_key = min(RESPONSE_CACHE.keys(), key=lambda k: RESPONSE_CACHE[k]['timestamp'])
+            del RESPONSE_CACHE[oldest_key]
+        
+        # Create a clean copy for caching
+        cache_data = response_data.copy()
+        RESPONSE_CACHE[cache_key] = {
+            'data': cache_data,
+            'timestamp': time.time()
+        }
+        print(f"💾 Cached successful response for {cache_key} ({response_data.get('content_size', 0)} bytes)")
+
 def process_request_file(file_path):
-    """Process a single request file - store ALL content as raw files"""
+    """Ultra-fast request processing with caching and optimizations"""
     try:
         # Read the request data
         with open(file_path, 'r', encoding='utf-8') as f:
@@ -325,6 +593,29 @@ def process_request_file(file_path):
         body_encoding = request_data.get('body_encoding', 'utf-8')
         is_resource = request_data.get('is_resource', False)
         
+        # Check cache first for GET requests (only if caching is enabled)
+        cache_key = get_cache_key(url, method, headers, body) if RESPONSE_CACHE is not None else None
+        if cache_key and RESPONSE_CACHE is not None:
+            cached_response = get_cached_response(cache_key)
+            if cached_response:
+                print(f"⚡ Cache HIT for {url}")
+                # Create response file from cache
+                response_file = os.path.join(OUTGOING_DIR, f"resp_{request_id}.json")
+                cached_response['id'] = request_id  # Update request ID
+                with open(response_file, 'w', encoding='utf-8') as f:
+                    json.dump(cached_response, f, ensure_ascii=False, indent=2)
+                
+                # Queue for background upload
+                try:
+                    response_upload_queue.put_nowait((response_file, f"resp_{request_id}.json"))
+                    return True
+                except queue.Full:
+                    # Fallback to sync upload
+                    success = upload_response_file(response_file, f"resp_{request_id}.json")
+                    if success:
+                        os.remove(response_file)
+                    return success
+        
         print(f"Processing request: {url} (Resource: {is_resource})")
         
         # Extract domain
@@ -333,13 +624,23 @@ def process_request_file(file_path):
         # Apply cookies to request headers
         headers = apply_cookies_to_headers(headers, domain)
         
+        # Handle conditional requests for better caching
+        if is_resource and method == 'GET':
+            # Check if browser sent If-None-Match (ETag)
+            if_none_match = headers.get('If-None-Match')
+            if if_none_match:
+                # Browser is checking if resource changed
+                print(f"🔄 Conditional request for {url} with ETag {if_none_match}")
+                # Keep the conditional header for the upstream server
+                headers['If-None-Match'] = if_none_match
+        
         # Apply enhanced authentication for hot.net domains
         if auth_manager and auth_manager.is_hot_net_domain(url):
             headers = auth_manager.apply_auth_to_headers(url, headers)
             print(f"Applied enhanced auth for hot.net domain: {domain}")
         
-        # Add realistic browser headers
-        headers = add_browser_headers(headers)
+        # Add realistic browser headers optimized for caching
+        headers = add_browser_headers(headers, url, is_resource)
         
         # Make the HTTP request
         try:
@@ -453,6 +754,22 @@ def process_request_file(file_path):
                     print(f"Failed to upload raw content file")
                     raw_content_file = None  # Mark as failed
             
+            # Add proper caching headers for browser performance
+            if is_resource and response_code == 200:
+                if url.endswith(('.css', '.js')):
+                    response_headers['Cache-Control'] = 'public, max-age=3600'  # 1 hour
+                elif url.endswith(('.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico')):
+                    response_headers['Cache-Control'] = 'public, max-age=86400'  # 24 hours
+                elif url.endswith(('.woff', '.woff2', '.ttf', '.eot')):
+                    response_headers['Cache-Control'] = 'public, max-age=604800'  # 1 week
+                
+                # Add ETag for conditional requests
+                if len(response_body) > 0:
+                    import hashlib
+                    etag = hashlib.md5(response_body).hexdigest()[:16]
+                    response_headers['ETag'] = f'"{etag}"'
+                    response_headers['Last-Modified'] = datetime.datetime.utcnow().strftime('%a, %d %b %Y %H:%M:%S GMT')
+            
             # Create minimal response JSON (just metadata, no content)
             response_data = {
                 "id": request_id,
@@ -464,6 +781,10 @@ def process_request_file(file_path):
                 "is_resource": is_resource,
                 "content_type": content_type
             }
+            
+            # Cache all successful resource responses (let browser handle its own caching)
+            if (cache_key and response_code == 200 and is_resource and len(response_body) > 0):
+                cache_response(cache_key, response_data.copy())
             
             # For tiny responses or 304 responses, include content inline
             if raw_content_file is None and len(response_body) <= RAW_CONTENT_THRESHOLD:
@@ -483,14 +804,17 @@ def process_request_file(file_path):
                 
             print(f"Response metadata file created: {response_file}")
             
-            # Upload response file to Mac
-            if upload_response_file(response_file, f"resp_{request_id}.json"):
-                # Clean up local response file after successful upload
-                os.remove(response_file)
-                return True
-            else:
-                print(f"Failed to upload response file")
-                return False
+            # Queue response file for background upload (faster)
+            try:
+                response_upload_queue.put_nowait((response_file, f"resp_{request_id}.json"))
+                return True  # Don't wait for upload to complete
+            except queue.Full:
+                # Fallback to synchronous upload if queue is full
+                if upload_response_file(response_file, f"resp_{request_id}.json"):
+                    os.remove(response_file)
+                    return True
+                else:
+                    return False
                 
         except Exception as e:
             print(f"Error making request: {e}")
@@ -526,46 +850,108 @@ def process_request_file(file_path):
         traceback.print_exc()
         return False
 
-def check_request_files():
-    """Check for and process any request files"""
+def process_request_async(req_file):
+    """Process a single request file asynchronously with priority"""
     try:
-        # Sync files from Mac first
-        synced_files = sync_request_files()
+        file_path = os.path.join(INCOMING_DIR, req_file)
+        if not os.path.exists(file_path):
+            return False
+        
+        # Read request to determine priority
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                request_data = json.load(f)
+            url = request_data.get('url', '')
+            priority = get_request_priority(url)
+            resource_type = get_resource_type(url)
+            
+            print(f"Processing {resource_type} request (priority {priority}): {url}")
+        except:
+            priority = REQUEST_PRIORITIES['other']
+            
+        success = process_request_file(file_path)
+        
+        # Delete local file immediately after processing
+        try:
+            os.remove(file_path)
+        except Exception as e:
+            print(f"Error deleting {req_file}: {e}")
+        
+        return success
+    except Exception as e:
+        print(f"Error processing {req_file}: {e}")
+        return False
+
+def check_request_files_parallel():
+    """Ultra-fast parallel processing of request files"""
+    try:
+        # Fast sync files from Mac
+        synced_files = sync_request_files_fast()
         
         if not synced_files:
             return  # No files to process
         
-        print(f"Found {len(synced_files)} requests to process")
+        print(f"⚡ Processing {len(synced_files)} requests in parallel")
+        start_time = time.time()
         
-        for req_file in synced_files:
-            file_path = os.path.join(INCOMING_DIR, req_file)
+        # Sort files by priority for browser-like loading
+        def get_file_priority(req_file):
+            try:
+                file_path = os.path.join(INCOMING_DIR, req_file)
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    request_data = json.load(f)
+                url = request_data.get('url', '')
+                return get_request_priority(url)
+            except:
+                return REQUEST_PRIORITIES['other']
+        
+        # Sort by priority (lower number = higher priority)
+        synced_files_prioritized = sorted(synced_files, key=get_file_priority)
+        
+        # Process files in parallel using thread pool
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKER_THREADS) as executor:
+            # Submit high-priority files first
+            future_to_file = {executor.submit(process_request_async, req_file): req_file 
+                            for req_file in synced_files_prioritized}
             
-            if os.path.exists(file_path):
-                success = process_request_file(file_path)
-                
-                # Delete the local request file after processing
+            processed_files = []
+            for future in concurrent.futures.as_completed(future_to_file, timeout=60):
+                req_file = future_to_file[future]
                 try:
-                    os.remove(file_path)
-                    print(f"Deleted local request file: {file_path}")
+                    success = future.result()
+                    if success:
+                        processed_files.append(req_file)
                 except Exception as e:
-                    print(f"Error deleting local request file: {e}")
-                
-                # Clean up the request file on Mac
-                if success:
-                    cleanup_mac_request_file(req_file)
+                    print(f"Error processing {req_file}: {e}")
+        
+        # Single batch cleanup on Mac
+        if processed_files:
+            cleanup_mac_request_files_batch(processed_files)
+        
+        elapsed = time.time() - start_time
+        if processed_files:
+            print(f"⚡ Processed {len(processed_files)} requests in {elapsed:.2f}s ({len(processed_files)/elapsed:.1f} req/s)")
             
     except Exception as e:
-        print(f"Error checking request files: {e}")
+        print(f"Error in parallel processing: {e}")
 
 def main():
-    """Main function to run the handler"""
-    parser = argparse.ArgumentParser(description='SSH-syncing Windows bridge with raw file transfer')
+    """Main function to run the ultra-fast handler"""
+    parser = argparse.ArgumentParser(description='Ultra-fast SSH-syncing Windows bridge with browser-like performance')
     parser.add_argument('--no-cookies', action='store_true', help='Do not load cookies at startup')
     parser.add_argument('--reset-cookies', action='store_true', help='Reset cookie jar before starting')
     parser.add_argument('--mac-host', help='Mac SSH hostname or IP', required=True)
     parser.add_argument('--mac-user', help='Mac SSH username', required=True)
     parser.add_argument('--ssh-key', help='SSH private key file path')
+    parser.add_argument('--no-cache', action='store_true', help='Disable response caching')
+    parser.add_argument('--max-workers', type=int, default=6, help='Max worker threads')
     args = parser.parse_args()
+    
+    # Apply command line overrides
+    global MAX_WORKER_THREADS, RESPONSE_CACHE
+    MAX_WORKER_THREADS = args.max_workers
+    if args.no_cache:
+        RESPONSE_CACHE = None  # Disable caching completely
     
     # Update SSH config from command line
     MAC_SSH_CONFIG['host'] = args.mac_host
@@ -573,11 +959,11 @@ def main():
     if args.ssh_key:
         MAC_SSH_CONFIG['key_file'] = args.ssh_key
     
-    print(f"Starting SSH Raw Content Transfer Windows handler at {datetime.datetime.now()}")
-    print(f"Connecting to Mac: {MAC_SSH_CONFIG['user']}@{MAC_SSH_CONFIG['host']}")
-    print(f"Mac remote directory: {MAC_SSH_CONFIG['remote_base']}")
-    print(f"Raw content threshold: {RAW_CONTENT_THRESHOLD} bytes (nearly everything)")
-    print("Strategy: Transfer ALL content as original raw files to emulate real web traffic")
+    print(f"🚀 Starting ULTRA-FAST SSH Handler at {datetime.datetime.now()}")
+    print(f"⚡ Connecting to Mac: {MAC_SSH_CONFIG['user']}@{MAC_SSH_CONFIG['host']}")
+    print(f"📁 Mac remote directory: {MAC_SSH_CONFIG['remote_base']}")
+    print(f"📦 Raw content threshold: {RAW_CONTENT_THRESHOLD} bytes")
+    print(f"💨 Browser-like performance: Parallel processing, caching, optimized transfers")
     
     # Handle cookie options
     if args.reset_cookies:
@@ -604,22 +990,103 @@ def main():
         print(f"❌ SSH connectivity test failed: {e}")
         return
     
-    polling_interval = 1  # seconds
+    polling_interval = 0.1  # seconds - ultra-fast polling for browser-like responsiveness
+    
+    # Initialize connection pool and worker threads
+    init_ssh_connection_pool()
+    
+    print(f"⚡ Performance optimizations enabled:")
+    print(f"   - {MAX_WORKER_THREADS} parallel request processors")
+    print(f"   - {SSH_CONNECTION_POOL_SIZE} SSH connection pool")
+    print(f"   - {polling_interval}s polling interval")
+    print(f"   - Batch size: {BATCH_SIZE}")
     
     print("Starting main polling loop...")
     print("Press Ctrl+C to stop")
     
-    # Main loop
+    # Start background upload processor
+    upload_thread = threading.Thread(target=upload_queue_processor, daemon=True)
+    upload_thread.start()
+    
+    # Ultra-fast main loop with adaptive polling
     try:
+        consecutive_empty = 0
+        total_processed = 0
+        start_time = time.time()
+        
         while True:
-            check_request_files()
-            time.sleep(polling_interval)
+            loop_start = time.time()
+            
+            # Get initial count for metrics
+            initial_queue_size = response_upload_queue.qsize()
+            
+            # Use parallel processing
+            check_request_files_parallel()
+            
+            # Update metrics
+            total_processed += 1
+            if total_processed % 100 == 0:  # Stats every 100 loops
+                elapsed_total = time.time() - start_time
+                cache_hits = len(RESPONSE_CACHE)
+                queue_size = response_upload_queue.qsize()
+                print(f"⚡ Stats: {total_processed} loops in {elapsed_total:.1f}s, {cache_hits} cached, {queue_size} queued")
+            
+            # Adaptive polling based on work load
+            elapsed = time.time() - loop_start
+            if elapsed < 0.001:  # Very fast, probably no work
+                consecutive_empty += 1
+                if consecutive_empty > 20:
+                    time.sleep(polling_interval * 3)  # Slow down when very idle
+                elif consecutive_empty > 10:
+                    time.sleep(polling_interval * 2)  # Slow down when idle
+                else:
+                    time.sleep(polling_interval)
+            else:
+                consecutive_empty = 0
+                # If processing took time, poll faster for next batch
+                time.sleep(max(0.01, polling_interval - elapsed))
     except KeyboardInterrupt:
-        print("Shutting down...")
+        print("\n🛑 Shutting down ultra-fast handler...")
+        
+        # Signal upload thread to stop
+        response_upload_queue.put(None)
+        upload_thread.join(timeout=2)
+        
+        # Save state
         save_cookies()
+        
+        # Final stats
+        elapsed_total = time.time() - start_time
+        cache_hits = len(RESPONSE_CACHE)
+        print(f"📊 Final stats: {total_processed} loops in {elapsed_total:.1f}s, {cache_hits} responses cached")
+        print("✅ Shutdown complete")
+        
     except Exception as e:
-        print(f"Error in main loop: {e}")
+        print(f"💥 Error in main loop: {e}")
         save_cookies()
+
+# Background upload queue processor for even better performance
+def upload_queue_processor():
+    """Background thread to handle uploads asynchronously"""
+    while True:
+        try:
+            upload_task = response_upload_queue.get(timeout=1)
+            if upload_task is None:  # Shutdown signal
+                break
+                
+            file_path, filename = upload_task
+            if os.path.exists(file_path):
+                upload_response_file(file_path, filename)
+                try:
+                    os.remove(file_path)
+                except Exception:
+                    pass
+                    
+            response_upload_queue.task_done()
+        except queue.Empty:
+            continue
+        except Exception as e:
+            print(f"Upload queue error: {e}")
 
 if __name__ == "__main__":
     main()

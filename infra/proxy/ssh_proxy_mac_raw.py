@@ -26,6 +26,14 @@ from urllib.parse import urlparse
 # Configuration
 PORT = 8000
 DEBUG = True
+MAX_CONCURRENT_REQUESTS = 12  # HTTP/2-like concurrency
+REQUEST_TIMEOUT = 45  # Reduced timeout for faster failure handling
+FILE_POLL_INTERVAL = 0.1  # Faster polling for response files
+
+# Browser-like optimizations
+ENABLE_COMPRESSION = True  # Compress responses when possible
+COMPRESSION_MIN_SIZE = 1024  # Only compress files larger than 1KB
+COMPRESSION_TYPES = ['text/html', 'text/css', 'application/javascript', 'application/json', 'text/plain']
 
 # Setup logging
 LOG_FILE = os.path.expanduser("~/Hot/infra/proxy/proxy_debug.log")
@@ -87,6 +95,17 @@ def create_ssl_certificate():
 
 # Global dictionary to track recent requests and prevent duplicates
 recent_requests = {}
+
+# Request processing queue for better throughput
+import queue
+import concurrent.futures
+request_queue = queue.Queue(maxsize=50)
+response_cache = {}  # Cache responses to avoid duplicate processing
+
+# Static asset cache for Mac-side caching
+static_asset_cache = {}
+STATIC_CACHE_MAX_SIZE = 200
+STATIC_CACHE_MAX_AGE = 3600  # 1 hour for static assets
 
 # List of domains to ignore/handle specially
 IGNORED_DOMAINS = [
@@ -151,6 +170,23 @@ class RawContentProxyHandler(http.server.BaseHTTPRequestHandler):
         # Determine if this is a resource request
         is_resource = self._is_resource_request(parsed_url.path)
         
+        # Let browser handle caching - only intercept if browser explicitly allows caching
+        headers = dict(self.headers)
+        
+        # Check if browser is asking for cached content (has If-None-Match or If-Modified-Since)
+        has_cache_headers = any(h in headers for h in ['If-None-Match', 'If-Modified-Since'])
+        
+        # Only use Mac cache if browser is making a conditional request
+        if has_cache_headers and self._is_static_asset(url):
+            static_cache_key = self._get_static_cache_key(method, url, headers)
+            if static_cache_key:
+                cached_response = self._get_cached_static_response(static_cache_key)
+                if cached_response:
+                    if DEBUG:
+                        print(f"⚡ Mac cache HIT for conditional request: {url}")
+                    self._send_cached_static_response(cached_response)
+                    return
+        
         # Create unique request ID with deduplication
         request_key = f"{method}:{url}"
         current_time = time.time()
@@ -183,14 +219,110 @@ class RawContentProxyHandler(http.server.BaseHTTPRequestHandler):
                 self.send_error(500, "Failed to write request file")
                 return
         
-        # Wait for response file from Windows
-        self._wait_and_process_response(request_id, url, is_resource)
+        # Add to processing queue for better concurrency
+        request_item = {
+            'request_id': request_id,
+            'url': url,
+            'is_resource': is_resource,
+            'handler': self
+        }
+        
+        try:
+            request_queue.put(request_item, timeout=1)
+            # Process immediately if queue is not full
+            self._wait_and_process_response(request_id, url, is_resource)
+        except queue.Full:
+            # If queue is full, process synchronously
+            self._wait_and_process_response(request_id, url, is_resource)
     
     def _is_resource_request(self, path):
         """Determine if request is for a resource (CSS, JS, image, etc.)"""
         path_lower = path.lower()
         return path_lower.endswith(('.css', '.js', '.png', '.jpg', '.jpeg', '.gif', 
                                    '.svg', '.woff', '.woff2', '.ttf', '.eot', '.ico'))
+    
+    def _is_static_asset(self, url):
+        """Check if URL is a static asset that should be cached on Mac"""
+        # Static assets that rarely change and are good candidates for Mac-side caching
+        static_extensions = ('.css', '.js', '.png', '.jpg', '.jpeg', '.gif', '.svg', 
+                           '.ico', '.woff', '.woff2', '.ttf', '.eot', '.pdf')
+        return any(url.lower().endswith(ext) for ext in static_extensions)
+    
+    def _get_static_cache_key(self, method, url, headers):
+        """Generate cache key for static assets"""
+        if method != 'GET':
+            return None
+        if not self._is_static_asset(url):
+            return None
+        
+        # Include relevant headers that might affect the response
+        cache_headers = []
+        for header in ['Accept', 'Accept-Encoding']:
+            if header in headers:
+                cache_headers.append(f"{header}:{headers[header]}")
+        
+        cache_key = f"{url}|{'|'.join(cache_headers)}"
+        return cache_key
+    
+    def _get_cached_static_response(self, cache_key):
+        """Get cached static asset response if available"""
+        if cache_key in static_asset_cache:
+            cached = static_asset_cache[cache_key]
+            if time.time() - cached['timestamp'] < STATIC_CACHE_MAX_AGE:
+                return cached['response_data']
+            else:
+                # Remove expired entry
+                del static_asset_cache[cache_key]
+        return None
+    
+    def _cache_static_response(self, cache_key, response_data):
+        """Cache static asset response"""
+        if not cache_key:
+            return
+            
+        # Limit cache size
+        if len(static_asset_cache) >= STATIC_CACHE_MAX_SIZE:
+            # Remove oldest entry
+            oldest_key = min(static_asset_cache.keys(), 
+                           key=lambda k: static_asset_cache[k]['timestamp'])
+            del static_asset_cache[oldest_key]
+        
+        static_asset_cache[cache_key] = {
+            'response_data': response_data,
+            'timestamp': time.time()
+        }
+        if DEBUG:
+            print(f"💾 Cached static asset: {cache_key[:100]}...")
+    
+    def _send_cached_static_response(self, cached_response):
+        """Send cached static asset response directly to browser"""
+        try:
+            status_code = cached_response.get('status', 200)
+            headers = cached_response.get('headers', {})
+            content_bytes = cached_response.get('content_bytes', b'')
+            
+            self.send_response(status_code)
+            
+            # Send headers with cache indicators
+            skip_headers = {'transfer-encoding', 'content-length', 'connection'}
+            for header, value in headers.items():
+                if header.lower() not in skip_headers:
+                    self.send_header(header, value)
+            
+            self.send_header('Content-Length', str(len(content_bytes)))
+            self.send_header('X-Cache', 'MAC-HIT')  # Indicate Mac-side cache hit
+            self.end_headers()
+            
+            if content_bytes:
+                self.wfile.write(content_bytes)
+                
+            if DEBUG:
+                print(f"⚡ Served from Mac cache: {status_code} ({len(content_bytes)} bytes)")
+                
+        except Exception as e:
+            if DEBUG:
+                print(f"Error sending cached static response: {e}")
+            self.send_error(500, "Cache error")
     
     def _prepare_request_data(self, method, url, request_id, is_resource):
         """Prepare request data for transfer"""
@@ -305,18 +437,48 @@ class RawContentProxyHandler(http.server.BaseHTTPRequestHandler):
             return False
     
     def _wait_and_process_response(self, request_id, url, is_resource):
-        """Wait for response file from Windows and process it"""
-        timeout = 60  # seconds
+        """Optimized wait for response file from Windows with caching"""
+        # Check response cache first
+        cache_key = f"{request_id}_{url}"
+        if cache_key in response_cache:
+            cached_response = response_cache[cache_key]
+            if time.time() - cached_response['timestamp'] < 300:  # 5 min cache
+                if DEBUG:
+                    print(f"Using cached response for: {url}")
+                self._send_cached_response(cached_response)
+                return
+        
+        timeout = REQUEST_TIMEOUT
         start_time = time.time()
         response_file = os.path.join(LOCAL_INCOMING, f"resp_{request_id}.json")
         
-        # Poll for response file
+        # Optimized polling with adaptive intervals
+        poll_count = 0
         while not os.path.exists(response_file) and (time.time() - start_time < timeout):
-            time.sleep(0.2)
+            poll_count += 1
+            # Adaptive polling: faster initially, slower as time progresses
+            if poll_count < 50:  # First 5 seconds
+                time.sleep(FILE_POLL_INTERVAL)
+            elif poll_count < 150:  # Next 20 seconds  
+                time.sleep(0.2)
+            else:  # After 25 seconds
+                time.sleep(0.5)
         
         if os.path.exists(response_file):
             try:
-                self._process_response_file(response_file, url, is_resource)
+                response_data = self._process_response_file(response_file, url, is_resource)
+                
+                # Cache successful responses for resources
+                if is_resource and response_data:
+                    response_cache[cache_key] = {
+                        'data': response_data,
+                        'timestamp': time.time()
+                    }
+                    # Limit cache size
+                    if len(response_cache) > 100:
+                        oldest_key = min(response_cache.keys(), 
+                                       key=lambda k: response_cache[k]['timestamp'])
+                        del response_cache[oldest_key]
                 
                 # Clean up response file
                 os.remove(response_file)
@@ -327,25 +489,77 @@ class RawContentProxyHandler(http.server.BaseHTTPRequestHandler):
                 if DEBUG:
                     print(f"Error processing response: {e}")
                     traceback.print_exc()
-                self.send_error(500, f"Error processing response: {str(e)}")
+                
+                # For static assets, return empty response instead of 500 error
+                if is_resource:
+                    print(f"⚠️ Static asset error for {url}, returning empty response")
+                    self.send_response(200)
+                    if url.endswith('.css'):
+                        self.send_header('Content-Type', 'text/css')
+                    elif url.endswith('.js'):
+                        self.send_header('Content-Type', 'application/javascript')
+                    elif url.endswith(('.png', '.jpg', '.jpeg', '.gif')):
+                        self.send_header('Content-Type', 'image/png')
+                    else:
+                        self.send_header('Content-Type', 'application/octet-stream')
+                    self.send_header('Content-Length', '0')
+                    self.send_header('Cache-Control', 'no-cache')
+                    self.end_headers()
+                else:
+                    self.send_error(500, f"Error processing response: {str(e)}")
         else:
-            # Timeout
+            # Timeout - more graceful handling
             if DEBUG:
-                print(f"Timeout waiting for response: {request_id}")
+                print(f"Timeout waiting for response: {request_id} ({timeout}s)")
             
             if is_resource:
-                # For resources, return empty response instead of error
-                self.send_response(200)
-                if url.endswith('.css'):
-                    self.send_header('Content-Type', 'text/css')
-                elif url.endswith('.js'):
-                    self.send_header('Content-Type', 'application/javascript')
-                else:
-                    self.send_header('Content-Type', 'application/octet-stream')
-                self.send_header('Content-Length', '0')
-                self.end_headers()
+                # For resources, return minimal response
+                self._send_empty_resource_response(url)
             else:
                 self.send_error(504, "Gateway Timeout - No response from Windows")
+    
+    def _send_empty_resource_response(self, url):
+        """Send optimized empty response for resource timeouts"""
+        self.send_response(200)
+        if url.endswith('.css'):
+            self.send_header('Content-Type', 'text/css')
+        elif url.endswith('.js'):
+            self.send_header('Content-Type', 'application/javascript')
+        elif url.endswith(('.png', '.jpg', '.jpeg', '.gif')):
+            self.send_header('Content-Type', 'image/png')
+        else:
+            self.send_header('Content-Type', 'application/octet-stream')
+        self.send_header('Content-Length', '0')
+        self.send_header('Cache-Control', 'no-cache')
+        self.end_headers()
+    
+    def _send_cached_response(self, cached_response):
+        """Send cached response to client"""
+        try:
+            response_data = cached_response['data']
+            status_code = response_data.get('status', 200)
+            headers = response_data.get('headers', {})
+            content_bytes = response_data.get('content_bytes', b'')
+            
+            self.send_response(status_code)
+            
+            # Send headers
+            skip_headers = {'transfer-encoding', 'content-length', 'connection'}
+            for header, value in headers.items():
+                if header.lower() not in skip_headers:
+                    self.send_header(header, value)
+            
+            self.send_header('Content-Length', str(len(content_bytes)))
+            self.send_header('X-Cache', 'HIT')
+            self.end_headers()
+            
+            if content_bytes:
+                self.wfile.write(content_bytes)
+                
+        except Exception as e:
+            if DEBUG:
+                print(f"Error sending cached response: {e}")
+            self.send_error(500, "Cache error")
     
     def _process_response_file(self, response_file, url, is_resource):
         """Process response file and send to client using raw content files"""
@@ -396,8 +610,20 @@ class RawContentProxyHandler(http.server.BaseHTTPRequestHandler):
                 else:
                     if DEBUG:
                         print(f"Raw content file not found: {raw_content_path}")
-                    self.send_error(500, "Raw content file not found")
-                    return
+                    
+                    # For static assets, return empty response instead of 500 error
+                    if self._is_static_asset(url):
+                        if DEBUG:
+                            print(f"Returning empty response for missing static asset: {url}")
+                        self.send_response(200)
+                        self.send_header('Content-Type', headers.get('Content-Type', 'application/octet-stream'))
+                        self.send_header('Content-Length', '0')
+                        self.send_header('Cache-Control', 'no-cache')
+                        self.end_headers()
+                        return
+                    else:
+                        self.send_error(500, "Raw content file not found")
+                        return
             
             elif inline_content:
                 # Use inline content for small responses
@@ -406,9 +632,19 @@ class RawContentProxyHandler(http.server.BaseHTTPRequestHandler):
                 else:
                     content_bytes = inline_content.encode('utf-8')
             
-            # Enhanced HTML URL rewriting for better resource loading
+            # Enhanced HTML URL rewriting and resource hints for better resource loading
             if not is_binary and 'text/html' in headers.get('Content-Type', ''):
                 content_bytes = self._rewrite_html_urls(content_bytes, url)
+                content_bytes = self._add_resource_hints(content_bytes, url)
+            
+            # Apply compression for browser-like performance
+            original_size = len(content_bytes)
+            content_bytes, compression_applied = self._apply_compression(content_bytes, headers)
+            
+            if compression_applied and DEBUG:
+                compressed_size = len(content_bytes)
+                ratio = (1 - compressed_size / original_size) * 100
+                print(f"Applied compression: {original_size}→{compressed_size} bytes ({ratio:.1f}% reduction)")
             
             # Send response
             self.send_response(status_code)
@@ -428,12 +664,36 @@ class RawContentProxyHandler(http.server.BaseHTTPRequestHandler):
             
             if DEBUG:
                 print(f"Response sent: {status_code} ({len(content_bytes)} bytes)")
+            
+            # Only cache static assets that have proper cache headers and ETags
+            if (self._is_static_asset(url) and status_code == 200 and 
+                len(content_bytes) > 0 and len(content_bytes) < 2 * 1024 * 1024 and  # Cache up to 2MB
+                headers.get('ETag') and  # Only cache if server provides ETag
+                any(h in headers for h in ['Cache-Control', 'Expires'])):  # And cache headers
+                
+                static_cache_key = self._get_static_cache_key('GET', url, {})
+                if static_cache_key:
+                    cache_data = {
+                        'status': status_code,
+                        'headers': headers.copy(),
+                        'content_bytes': content_bytes
+                    }
+                    self._cache_static_response(static_cache_key, cache_data)
+            
+            # Return response data for caching
+            return {
+                'status': status_code,
+                'headers': headers,
+                'content_bytes': content_bytes
+            }
                 
         except Exception as e:
             if DEBUG:
                 print(f"Error processing response file: {e}")
                 traceback.print_exc()
             raise
+        
+        return None
     
     def _rewrite_html_urls(self, content_bytes, base_url):
         """Rewrite relative URLs in HTML to be absolute"""
@@ -476,6 +736,142 @@ class RawContentProxyHandler(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             if DEBUG:
                 print(f"Error rewriting HTML URLs: {e}")
+            return content_bytes
+    
+    def _wait_for_file_complete(self, response_file, max_wait=5.0):
+        """Wait for file to be completely written by checking size stability"""
+        last_size = -1
+        stable_count = 0
+        start_time = time.time()
+        
+        while time.time() - start_time < max_wait:
+            try:
+                current_size = os.path.getsize(response_file)
+                if current_size == 0:
+                    time.sleep(0.1)
+                    continue
+                    
+                if current_size == last_size:
+                    stable_count += 1
+                    if stable_count >= 3:  # Size stable for 3 checks
+                        return True
+                else:
+                    stable_count = 0
+                    last_size = current_size
+                    
+                time.sleep(0.1)
+            except (OSError, FileNotFoundError):
+                time.sleep(0.1)
+                continue
+        
+        return False
+    
+    def _read_response_file_with_retry(self, response_file, max_retries=3):
+        """Read JSON file with retry logic for race conditions"""
+        for attempt in range(max_retries):
+            try:
+                with open(response_file, 'r', encoding='utf-8') as f:
+                    content = f.read().strip()
+                    if not content:
+                        if attempt < max_retries - 1:
+                            logger.warning(f"🟡 RESPONSE: Empty file on attempt {attempt + 1}, retrying...")
+                            time.sleep(0.2)
+                            continue
+                        else:
+                            logger.error(f"🔴 RESPONSE: File {response_file} is empty after {max_retries} attempts")
+                            return None
+                    
+                    return json.loads(content)
+                    
+            except json.JSONDecodeError as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"🟡 RESPONSE: JSON decode error on attempt {attempt + 1}: {e}, retrying...")
+                    time.sleep(0.2)
+                    continue
+                else:
+                    logger.error(f"🔴 RESPONSE: JSON decode failed after {max_retries} attempts: {e}")
+                    return None
+            except Exception as e:
+                logger.error(f"🔴 RESPONSE: File read error: {e}")
+                return None
+        
+        return None
+    
+    def _apply_compression(self, content_bytes, headers):
+        """Apply compression to response content for browser-like performance"""
+        if not ENABLE_COMPRESSION or len(content_bytes) < COMPRESSION_MIN_SIZE:
+            return content_bytes, False
+        
+        content_type = headers.get('Content-Type', '').lower()
+        
+        # Only compress text-based content types
+        should_compress = any(ctype in content_type for ctype in COMPRESSION_TYPES)
+        if not should_compress:
+            return content_bytes, False
+        
+        # Check if client accepts gzip compression
+        client_accepts_gzip = 'gzip' in self.headers.get('Accept-Encoding', '').lower()
+        if not client_accepts_gzip:
+            return content_bytes, False
+        
+        try:
+            # Compress using gzip
+            compressed_data = gzip.compress(content_bytes)
+            
+            # Only use compression if it actually reduces size significantly
+            if len(compressed_data) < len(content_bytes) * 0.9:  # At least 10% reduction
+                headers['Content-Encoding'] = 'gzip'
+                headers['Vary'] = 'Accept-Encoding'
+                return compressed_data, True
+            else:
+                return content_bytes, False
+                
+        except Exception as e:
+            if DEBUG:
+                print(f"Compression failed: {e}")
+            return content_bytes, False
+    
+    def _add_resource_hints(self, content_bytes, base_url):
+        """Add browser resource hints for better performance"""
+        try:
+            content = content_bytes.decode('utf-8')
+            parsed_base = urlparse(base_url)
+            base_domain = f"{parsed_base.scheme}://{parsed_base.netloc}"
+            
+            # Find the </head> tag to insert resource hints
+            head_end = content.find('</head>')
+            if head_end == -1:
+                return content_bytes
+            
+            # Generate resource hints based on common patterns
+            hints = []
+            
+            # DNS prefetch for external domains
+            hints.append(f'<link rel="dns-prefetch" href="{base_domain}">')
+            
+            # Preconnect to same origin
+            hints.append(f'<link rel="preconnect" href="{base_domain}">')
+            
+            # Common CSS/JS preload patterns for hot.net
+            if 'hot.net' in base_domain:
+                hints.extend([
+                    '<link rel="preload" href="/assets/css/main.css" as="style" onload="this.onload=null;this.rel=\'stylesheet\'">',
+                    '<link rel="preload" href="/assets/js/app.js" as="script">',
+                    '<link rel="preload" href="/assets/fonts/main.woff2" as="font" type="font/woff2" crossorigin>',
+                ])
+            
+            # Insert hints before </head>
+            hints_html = '\n' + '\n'.join(hints) + '\n'
+            content = content[:head_end] + hints_html + content[head_end:]
+            
+            if DEBUG:
+                print(f"Added {len(hints)} resource hints to HTML")
+            
+            return content.encode('utf-8')
+            
+        except Exception as e:
+            if DEBUG:
+                print(f"Error adding resource hints: {e}")
             return content_bytes
     
     def _direct_request(self, method, url):
@@ -863,28 +1259,47 @@ class RawContentProxyHandler(http.server.BaseHTTPRequestHandler):
             self._send_tunnel_error_response(client_socket, 500, "Internal Server Error")
     
     def _wait_and_send_tunnel_response(self, request_id, client_socket, url, is_resource, request_count):
-        """Wait for SSH response and send back through HTTPS tunnel"""
-        timeout = 60  # seconds
+        """Optimized wait for SSH response and send back through HTTPS tunnel"""
+        timeout = REQUEST_TIMEOUT
         start_time = time.time()
         response_file = os.path.join(LOCAL_INCOMING, f"resp_{request_id}.json")
         
         logger.info(f"🟢 RESPONSE: Waiting for response file: {response_file}")
         
-        # Poll for response file
+        # Optimized polling with adaptive intervals
         poll_count = 0
         while not os.path.exists(response_file) and (time.time() - start_time < timeout):
             poll_count += 1
-            if poll_count % 25 == 0:  # Log every 5 seconds
-                logger.info(f"🟢 RESPONSE: Still waiting... ({poll_count * 0.2:.1f}s)")
-            time.sleep(0.2)
+            
+            # Log less frequently to reduce overhead
+            if poll_count % 50 == 0:  # Log every 5-10 seconds depending on interval
+                elapsed = time.time() - start_time
+                logger.info(f"🟢 RESPONSE: Still waiting... ({elapsed:.1f}s)")
+            
+            # Adaptive polling intervals
+            if poll_count < 100:  # First 10 seconds
+                time.sleep(FILE_POLL_INTERVAL)
+            elif poll_count < 250:  # Next 30 seconds
+                time.sleep(0.2)
+            else:  # After 40 seconds
+                time.sleep(0.5)
         
         if os.path.exists(response_file):
             try:
                 logger.info(f"🟢 RESPONSE: Found response file after {time.time() - start_time:.1f}s")
                 
-                # Read response data
-                with open(response_file, 'r', encoding='utf-8') as f:
-                    response_data = json.load(f)
+                # Wait for file to be completely written (fix race condition)
+                if not self._wait_for_file_complete(response_file):
+                    logger.error(f"🔴 RESPONSE ERROR: File {response_file} incomplete after timeout")
+                    self._send_tunnel_error_response(client_socket, 500, "Incomplete response file")
+                    return
+                
+                # Read response data with retry logic
+                response_data = self._read_response_file_with_retry(response_file)
+                if not response_data:
+                    logger.error(f"🔴 RESPONSE ERROR: Failed to read response file {response_file}")
+                    self._send_tunnel_error_response(client_socket, 500, "Response file read error")
+                    return
                 
                 status = response_data.get('status', 'unknown')
                 content_size = response_data.get('content_size', 0)
@@ -956,7 +1371,7 @@ class RawContentProxyHandler(http.server.BaseHTTPRequestHandler):
             response_line = f"HTTP/1.1 {status_code} OK\r\n"
             
             # Send headers (skip problematic ones for tunneling)
-            skip_headers = {'transfer-encoding', 'connection'}
+            skip_headers = {'transfer-encoding', 'connection', 'content-length'}
             header_count = 0
             for header, value in headers.items():
                 if header.lower() not in skip_headers:
@@ -1001,9 +1416,111 @@ class RawContentProxyHandler(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             logger.error(f"Error sending tunnel error response: {e}")
 
+def process_request_queue():
+    """Background thread to process queued requests for better concurrency"""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS//2) as executor:
+        while True:
+            try:
+                # Get request from queue with timeout
+                request_item = request_queue.get(timeout=1)
+                
+                # Submit for async processing
+                future = executor.submit(
+                    request_item['handler']._wait_and_process_response,
+                    request_item['request_id'],
+                    request_item['url'],
+                    request_item['is_resource']
+                )
+                
+                request_queue.task_done()
+                
+            except queue.Empty:
+                continue
+            except Exception as e:
+                if DEBUG:
+                    print(f"Error in request queue processing: {e}")
+
+def clear_all_caches():
+    """Clear all caches (static assets and response cache)"""
+    global static_asset_cache, response_cache
+    static_count = len(static_asset_cache)
+    response_count = len(response_cache)
+    
+    static_asset_cache.clear()
+    response_cache.clear()
+    
+    print(f"🧹 Cache cleared: {static_count} static assets + {response_count} responses")
+    logger.info(f"Cache manually cleared: {static_count} static assets + {response_count} responses")
+    return static_count + response_count
+
+def show_cache_stats():
+    """Show current cache statistics"""
+    static_count = len(static_asset_cache)
+    response_count = len(response_cache)
+    
+    print(f"📊 Cache Stats:")
+    print(f"   Static Assets: {static_count}/{STATIC_CACHE_MAX_SIZE}")
+    print(f"   Response Cache: {response_count}/{response_cache.get('max_size', 100)}")
+    
+    if static_count > 0:
+        print(f"   Static Cache Items:")
+        for i, (key, data) in enumerate(list(static_asset_cache.items())[:5]):
+            age = int(time.time() - data['timestamp'])
+            url = key.split('|')[0]
+            print(f"     {i+1}. {url[:60]}... (age: {age}s)")
+        if static_count > 5:
+            print(f"     ... and {static_count - 5} more")
+    
+    return static_count + response_count
+
+def handle_cache_commands():
+    """Handle keyboard shortcuts for cache management"""
+    import sys
+    import select
+    
+    if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
+        command = sys.stdin.readline().strip().lower()
+        
+        if command == 'clear' or command == 'c':
+            clear_all_caches()
+        elif command == 'stats' or command == 's':
+            show_cache_stats()
+        elif command == 'help' or command == 'h':
+            print("🎛️  Cache Commands:")
+            print("   c/clear  - Clear all caches")
+            print("   s/stats  - Show cache statistics")
+            print("   h/help   - Show this help")
+        elif command and command != '':
+            print(f"Unknown command: {command}. Type 'help' for available commands.")
+
 def main():
-    """Main function to run the SSH proxy server"""
-    logger.info(f"Starting SSH-based proxy server (Mac side - Raw Content) on port {PORT}")
+    """Main function to run the optimized SSH proxy server with cache management"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Optimized SSH proxy with dual-layer caching')
+    parser.add_argument('--clear-cache', action='store_true', help='Clear all caches on startup')
+    parser.add_argument('--no-static-cache', action='store_true', help='Disable static asset caching')
+    parser.add_argument('--browser-cache-only', action='store_true', help='Let browser handle all caching (recommended)')
+    parser.add_argument('--cache-stats', action='store_true', help='Show cache stats on startup')
+    args = parser.parse_args()
+    
+    # Handle startup cache options
+    if args.clear_cache:
+        clear_all_caches()
+    
+    if args.no_static_cache or args.browser_cache_only:
+        global STATIC_CACHE_MAX_SIZE
+        STATIC_CACHE_MAX_SIZE = 0
+        if args.browser_cache_only:
+            print("🌐 Browser-only caching mode: Let browser handle all caching naturally")
+        else:
+            print("🚫 Static asset caching disabled")
+    
+    logger.info(f"Starting OPTIMIZED SSH-based proxy server (Mac side - Raw Content) on port {PORT}")
+    logger.info(f"Max concurrent requests: {MAX_CONCURRENT_REQUESTS}")
+    logger.info(f"Request timeout: {REQUEST_TIMEOUT}s")
+    logger.info(f"File poll interval: {FILE_POLL_INTERVAL}s")
+    logger.info(f"Static cache size: {STATIC_CACHE_MAX_SIZE} entries")
     logger.info(f"Log file: {LOG_FILE}")
     logger.info(f"Request files directory: {LOCAL_OUTGOING}")
     logger.info(f"Response files directory: {LOCAL_INCOMING}")
@@ -1011,6 +1528,15 @@ def main():
     logger.info("Windows should SSH into this Mac to fetch request files and deliver responses")
     logger.info("Strategy: All content transferred as original raw files for proper web traffic emulation")
     logger.info("HTTPS tunnel: hot.net domains converted to HTTP processing via SSH with SSL termination")
+    logger.info("Optimizations: Dual-layer caching, connection pooling, adaptive polling, concurrent processing")
+    
+    print("🎛️  Cache Management Commands:")
+    print("   Type 'c' or 'clear' + Enter to clear all caches")
+    print("   Type 's' or 'stats' + Enter to show cache statistics")
+    print("   Type 'h' or 'help' + Enter for help")
+    
+    if args.cache_stats:
+        show_cache_stats()
     
     # Create SSL certificate for HTTPS tunneling
     if not create_ssl_certificate():
@@ -1046,28 +1572,78 @@ def main():
             if DEBUG:
                 print(f"Error in cleanup routine: {e}")
     
-    # Start cleanup thread
+    # Start background threads
     def cleanup_thread():
         while True:
             time.sleep(120)  # Run cleanup every 2 minutes
             cleanup_old_files()
+            # Also clean response cache
+            current_time = time.time()
+            # Clean response cache
+            expired_keys = [k for k, v in response_cache.items() 
+                          if current_time - v['timestamp'] > 600]  # 10 min expiry
+            for key in expired_keys:
+                del response_cache[key]
+                
+            # Clean static asset cache
+            expired_static_keys = [k for k, v in static_asset_cache.items() 
+                                 if current_time - v['timestamp'] > STATIC_CACHE_MAX_AGE]
+            for key in expired_static_keys:
+                del static_asset_cache[key]
+                
+            if (expired_keys or expired_static_keys) and DEBUG:
+                print(f"Cleaned up {len(expired_keys)} response cache + {len(expired_static_keys)} static cache entries")
     
     cleanup = threading.Thread(target=cleanup_thread, daemon=True)
     cleanup.start()
     
-    # Configure and start server
+    # Start request queue processor
+    queue_processor = threading.Thread(target=process_request_queue, daemon=True)
+    queue_processor.start()
+    
+    # Configure and start optimized server
     socketserver.ThreadingTCPServer.allow_reuse_address = True
     server_address = ('localhost', PORT)
     
+    # Configure threading parameters for better performance
+    class OptimizedThreadingTCPServer(socketserver.ThreadingTCPServer):
+        daemon_threads = True
+        max_children = MAX_CONCURRENT_REQUESTS
+        
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # Enable TCP keepalive for better connection management
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    
     try:
-        with socketserver.ThreadingTCPServer(server_address, RawContentProxyHandler) as server:
-            print(f"Proxy server running on {server_address[0]}:{server_address[1]}")
+        with OptimizedThreadingTCPServer(server_address, RawContentProxyHandler) as server:
+            print(f"Optimized proxy server running on {server_address[0]}:{server_address[1]}")
+            print(f"Performance: {MAX_CONCURRENT_REQUESTS} max concurrent, {REQUEST_TIMEOUT}s timeout, caching enabled")
+            
+            # Start cache command handler in a separate thread
+            def cache_command_loop():
+                while True:
+                    try:
+                        handle_cache_commands()
+                        time.sleep(0.5)  # Check for commands twice per second
+                    except Exception as e:
+                        if DEBUG:
+                            print(f"Cache command error: {e}")
+            
+            cache_thread = threading.Thread(target=cache_command_loop, daemon=True)
+            cache_thread.start()
+            
             server.serve_forever()
     except KeyboardInterrupt:
-        print("\nShutting down proxy server...")
+        print("\nShutting down optimized proxy server...")
         cleanup_old_files()  # Final cleanup
+        # Clear response cache
+        response_cache.clear()
+        print("Cleanup completed")
     except Exception as e:
         print(f"Server error: {e}")
+        logger.error(f"Server error: {e}", exc_info=True)
 
 if __name__ == "__main__":
     main()
