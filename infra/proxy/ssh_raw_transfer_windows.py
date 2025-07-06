@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SSH-based Windows handler that transfers ALL content as raw files
+user centric SSH-based Windows handler that transfers ALL content as raw files
 Emulates original win_exec_bridge.py approach but with SSH file sync
 All JS, CSS, images transferred as original files to preserve web traffic behavior
 """
@@ -353,7 +353,7 @@ def sync_request_files_fast():
     try:
         # Single SSH command to list and count files in one go
         ssh_cmd = build_ssh_cmd(f"cd {MAC_OUTGOING} && ls req_*.json 2>/dev/null || echo 'NOFILES'", is_command=True)
-        result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=5)
+        result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=2)
         
         if result.returncode != 0 or 'NOFILES' in result.stdout:
             return []  # No files to sync
@@ -377,7 +377,7 @@ def sync_request_files_fast():
                 file_spec = f"{MAC_OUTGOING}/req_*.json"
                 scp_cmd = build_ssh_cmd(file_spec, is_command=False)
             
-            result = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=15)
+            result = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=8)
             
             if result.returncode == 0:
                 # Verify what we actually got
@@ -1045,7 +1045,7 @@ def main():
         print(f"❌ SSH connectivity test failed: {e}")
         return
     
-    polling_interval = 0.05  # seconds - ultra-fast polling for browser-like responsiveness (50ms)
+    polling_interval = 0.02  # seconds - ultra-fast polling for browser-like responsiveness (20ms)
     
     # Initialize connection pool and worker threads
     init_ssh_connection_pool()

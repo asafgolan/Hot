@@ -26,9 +26,9 @@ from urllib.parse import urlparse
 # Configuration
 PORT = 8000
 DEBUG = True
-MAX_CONCURRENT_REQUESTS = 12  # HTTP/2-like concurrency
-REQUEST_TIMEOUT = 45  # Reduced timeout for faster failure handling
-FILE_POLL_INTERVAL = 0.1  # Faster polling for response files
+MAX_CONCURRENT_REQUESTS = 24  # HTTP/2-like concurrency (doubled for faster processing)
+REQUEST_TIMEOUT = 15  # Ultra-fast timeout for browser-like responsiveness
+FILE_POLL_INTERVAL = 0.05  # Ultra-fast polling for response files (50ms)
 
 # Browser-like optimizations
 ENABLE_COMPRESSION = True  # Compress responses when possible
@@ -106,6 +106,7 @@ response_cache = {}  # Cache responses to avoid duplicate processing
 static_asset_cache = {}
 STATIC_CACHE_MAX_SIZE = 200
 STATIC_CACHE_MAX_AGE = 3600  # 1 hour for static assets
+IMAGE_CACHE_MAX_AGE = 86400  # 24 hours for images (like real browsers)
 
 # List of domains to ignore/handle specially
 IGNORED_DOMAINS = [
@@ -179,8 +180,9 @@ class RawContentProxyHandler(http.server.BaseHTTPRequestHandler):
             if static_cache_key:
                 cached_response = self._get_cached_static_response(static_cache_key)
                 if cached_response:
+                    cache_type = "IMAGE" if static_cache_key.startswith('image:') else "STATIC"
                     if DEBUG:
-                        print(f"⚡ Mac cache HIT for static asset: {url}")
+                        print(f"⚡ Mac {cache_type} cache HIT: {url}")
                     self._send_cached_static_response(cached_response)
                     return
         
@@ -252,20 +254,30 @@ class RawContentProxyHandler(http.server.BaseHTTPRequestHandler):
         if not self._is_static_asset(url):
             return None
         
-        # Include relevant headers that might affect the response
-        cache_headers = []
-        for header in ['Accept', 'Accept-Encoding']:
-            if header in headers:
-                cache_headers.append(f"{header}:{headers[header]}")
+        # For images, use simplified cache key that ignores Accept headers
+        # This allows images to be shared between different request contexts (IMG tags, JS, etc.)
+        if any(url.lower().endswith(ext) for ext in ('.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.webp')):
+            # Images: cache key based only on URL for maximum reuse
+            cache_key = f"image:{url}"
+        else:
+            # Other static assets: include Accept headers that might affect response
+            cache_headers = []
+            for header in ['Accept', 'Accept-Encoding']:
+                if header in headers:
+                    cache_headers.append(f"{header}:{headers[header]}")
+            cache_key = f"{url}|{'|'.join(cache_headers)}"
         
-        cache_key = f"{url}|{'|'.join(cache_headers)}"
         return cache_key
     
     def _get_cached_static_response(self, cache_key):
         """Get cached static asset response if available"""
         if cache_key in static_asset_cache:
             cached = static_asset_cache[cache_key]
-            if time.time() - cached['timestamp'] < STATIC_CACHE_MAX_AGE:
+            
+            # Use longer cache time for images
+            max_age = IMAGE_CACHE_MAX_AGE if cache_key.startswith('image:') else STATIC_CACHE_MAX_AGE
+            
+            if time.time() - cached['timestamp'] < max_age:
                 return cached['response_data']
             else:
                 # Remove expired entry
@@ -288,8 +300,9 @@ class RawContentProxyHandler(http.server.BaseHTTPRequestHandler):
             'response_data': response_data,
             'timestamp': time.time()
         }
+        cache_type = "IMAGE" if cache_key.startswith('image:') else "STATIC"
         if DEBUG:
-            print(f"💾 Cached static asset: {cache_key[:100]}...")
+            print(f"💾 Cached {cache_type} asset: {cache_key[:100]}...")
     
     def _send_cached_static_response(self, cached_response):
         """Send cached static asset response directly to browser"""
@@ -324,6 +337,9 @@ class RawContentProxyHandler(http.server.BaseHTTPRequestHandler):
     def _prepare_request_data(self, method, url, request_id, is_resource):
         """Prepare request data for transfer"""
         headers = dict(self.headers)
+        
+        # Store original headers for cache key generation
+        self._original_request_headers = headers.copy()
         
         # Read body for POST requests
         body = ""
@@ -453,13 +469,13 @@ class RawContentProxyHandler(http.server.BaseHTTPRequestHandler):
         poll_count = 0
         while not os.path.exists(response_file) and (time.time() - start_time < timeout):
             poll_count += 1
-            # Adaptive polling: faster initially, slower as time progresses
-            if poll_count < 50:  # First 5 seconds
-                time.sleep(FILE_POLL_INTERVAL)
-            elif poll_count < 150:  # Next 20 seconds  
-                time.sleep(0.2)
-            else:  # After 25 seconds
-                time.sleep(0.5)
+            # Ultra-aggressive adaptive polling for browser-like speed
+            if poll_count < 200:  # First 10 seconds (200 * 0.05 = 10s)
+                time.sleep(FILE_POLL_INTERVAL)  # 50ms polling
+            elif poll_count < 300:  # Next 5 seconds
+                time.sleep(0.1)  # 100ms polling
+            else:  # After 15 seconds
+                time.sleep(0.2)  # 200ms polling
         
         if os.path.exists(response_file):
             try:
@@ -662,13 +678,13 @@ class RawContentProxyHandler(http.server.BaseHTTPRequestHandler):
             if DEBUG:
                 print(f"Response sent: {status_code} ({len(content_bytes)} bytes)")
             
-            # Only cache static assets that have proper cache headers and ETags
+            # Cache static assets more aggressively like a real browser
             if (self._is_static_asset(url) and status_code == 200 and 
-                len(content_bytes) > 0 and len(content_bytes) < 2 * 1024 * 1024 and  # Cache up to 2MB
-                headers.get('ETag') and  # Only cache if server provides ETag
-                any(h in headers for h in ['Cache-Control', 'Expires'])):  # And cache headers
+                len(content_bytes) > 0 and len(content_bytes) < 2 * 1024 * 1024):  # Cache up to 2MB
                 
-                static_cache_key = self._get_static_cache_key('GET', url, {})
+                # Get original request headers from the request context if available
+                request_headers = getattr(self, '_original_request_headers', {})
+                static_cache_key = self._get_static_cache_key('GET', url, request_headers)
                 if static_cache_key:
                     cache_data = {
                         'status': status_code,
@@ -1215,6 +1231,20 @@ class RawContentProxyHandler(http.server.BaseHTTPRequestHandler):
             parsed_url = urlparse(url)
             is_resource = self._is_resource_request(parsed_url.path)
             
+            # Store original headers for cache key generation
+            self._original_request_headers = headers.copy()
+            
+            # Check cache first for static assets (same as regular HTTP requests)
+            if self._is_static_asset(url):
+                static_cache_key = self._get_static_cache_key(method, url, headers)
+                if static_cache_key:
+                    cached_response = self._get_cached_static_response(static_cache_key)
+                    if cached_response:
+                        cache_type = "IMAGE" if static_cache_key.startswith('image:') else "STATIC"
+                        logger.info(f"⚡ HTTPS {cache_type} cache HIT: {url}")
+                        self._send_cached_tunnel_response(cached_response, client_socket, request_count)
+                        return
+            
             # Generate request ID
             request_id = str(uuid.uuid4())
             
@@ -1273,13 +1303,13 @@ class RawContentProxyHandler(http.server.BaseHTTPRequestHandler):
                 elapsed = time.time() - start_time
                 logger.info(f"🟢 RESPONSE: Still waiting... ({elapsed:.1f}s)")
             
-            # Adaptive polling intervals
-            if poll_count < 100:  # First 10 seconds
-                time.sleep(FILE_POLL_INTERVAL)
-            elif poll_count < 250:  # Next 30 seconds
-                time.sleep(0.2)
-            else:  # After 40 seconds
-                time.sleep(0.5)
+            # Ultra-aggressive polling for tunnel responses
+            if poll_count < 200:  # First 10 seconds (200 * 0.05 = 10s)
+                time.sleep(FILE_POLL_INTERVAL)  # 50ms polling
+            elif poll_count < 300:  # Next 5 seconds  
+                time.sleep(0.1)  # 100ms polling
+            else:  # After 15 seconds
+                time.sleep(0.2)  # 200ms polling
         
         if os.path.exists(response_file):
             try:
@@ -1304,7 +1334,24 @@ class RawContentProxyHandler(http.server.BaseHTTPRequestHandler):
                 logger.info(f"🟢 RESPONSE: Status {status}, Size {content_size}, Raw file: {raw_file}")
                 
                 # Send HTTP response through tunnel
-                self._send_tunnel_http_response(client_socket, response_data, url, request_count)
+                content_bytes = self._send_tunnel_http_response(client_socket, response_data, url, request_count)
+                
+                # Cache static assets for future requests (same as regular HTTP)
+                if (self._is_static_asset(url) and status == 200 and 
+                    content_bytes and len(content_bytes) > 0 and len(content_bytes) < 2 * 1024 * 1024):
+                    
+                    # Get original request headers for cache key
+                    headers_for_cache = getattr(self, '_original_request_headers', {})
+                    static_cache_key = self._get_static_cache_key('GET', url, headers_for_cache)
+                    if static_cache_key:
+                        cache_data = {
+                            'status': status,
+                            'headers': response_data.get('headers', {}).copy(),
+                            'content_bytes': content_bytes
+                        }
+                        self._cache_static_response(static_cache_key, cache_data)
+                        cache_type = "IMAGE" if static_cache_key.startswith('image:') else "STATIC"
+                        logger.info(f"💾 Cached HTTPS {cache_type} asset: {url}")
                 
                 # Clean up response file
                 os.remove(response_file)
@@ -1376,7 +1423,8 @@ class RawContentProxyHandler(http.server.BaseHTTPRequestHandler):
                     header_count += 1
             
             response_line += f"Content-Length: {len(content_bytes)}\r\n"
-            response_line += "Connection: close\r\n"
+            response_line += "Connection: keep-alive\r\n"  # Enable HTTP/2-like connection reuse
+            response_line += "Keep-Alive: timeout=30, max=100\r\n"  # Allow up to 100 requests per connection
             response_line += "\r\n"
             
             logger.info(f"🔵 SEND: Sending {len(response_line)} bytes of headers + {len(content_bytes)} bytes of content")
@@ -1390,10 +1438,14 @@ class RawContentProxyHandler(http.server.BaseHTTPRequestHandler):
                 bytes_sent_content = client_socket.send(content_bytes)
             
             logger.info(f"🟢 SEND SUCCESS: Sent tunnel response #{request_count} - {status_code} ({bytes_sent_headers}+{bytes_sent_content} bytes)")
+            
+            # Return content bytes for caching
+            return content_bytes
                 
         except Exception as e:
             logger.error(f"🔴 SEND ERROR: Error sending tunnel response #{request_count}: {e}")
             logger.error(traceback.format_exc())
+            return b''  # Return empty bytes on error
     
     def _send_tunnel_error_response(self, client_socket, status_code, message):
         """Send error response through HTTPS tunnel"""
@@ -1412,6 +1464,48 @@ class RawContentProxyHandler(http.server.BaseHTTPRequestHandler):
             
         except Exception as e:
             logger.error(f"Error sending tunnel error response: {e}")
+    
+    def _send_cached_tunnel_response(self, cached_response, client_socket, request_count):
+        """Send cached response through HTTPS tunnel"""
+        try:
+            status_code = cached_response.get('status', 200)
+            headers = cached_response.get('headers', {})
+            content_bytes = cached_response.get('content_bytes', b'')
+            
+            logger.info(f"🔵 CACHE: Sending cached tunnel response #{request_count} - Status {status_code}")
+            logger.info(f"🔵 CACHE: Cached content: {len(content_bytes)} bytes")
+            
+            # Build HTTP response
+            response_line = f"HTTP/1.1 {status_code} OK\r\n"
+            
+            # Send headers (skip problematic ones for tunneling)
+            skip_headers = {'transfer-encoding', 'connection', 'content-length'}
+            header_count = 0
+            for header, value in headers.items():
+                if header.lower() not in skip_headers:
+                    response_line += f"{header}: {value}\r\n"
+                    header_count += 1
+            
+            response_line += f"Content-Length: {len(content_bytes)}\r\n"
+            response_line += "Connection: keep-alive\r\n"  # Enable HTTP/2-like connection reuse
+            response_line += "Keep-Alive: timeout=30, max=100\r\n"  # Allow up to 100 requests per connection
+            response_line += "X-Cache: MAC-HIT\r\n"  # Indicate cache hit
+            response_line += "\r\n"
+            
+            logger.info(f"🔵 CACHE: Sending {len(response_line)} bytes of headers + {len(content_bytes)} bytes of content")
+            
+            # Send response
+            bytes_sent_headers = client_socket.send(response_line.encode('utf-8'))
+            bytes_sent_content = 0
+            
+            if content_bytes:
+                bytes_sent_content = client_socket.send(content_bytes)
+            
+            logger.info(f"⚡ CACHE SUCCESS: Sent cached tunnel response #{request_count} - {status_code} ({bytes_sent_headers}+{bytes_sent_content} bytes)")
+                
+        except Exception as e:
+            logger.error(f"🔴 CACHE ERROR: Error sending cached tunnel response #{request_count}: {e}")
+            logger.error(traceback.format_exc())
 
 def process_request_queue():
     """Background thread to process queued requests for better concurrency"""
@@ -1582,9 +1676,12 @@ def main():
             for key in expired_keys:
                 del response_cache[key]
                 
-            # Clean static asset cache
-            expired_static_keys = [k for k, v in static_asset_cache.items() 
-                                 if current_time - v['timestamp'] > STATIC_CACHE_MAX_AGE]
+            # Clean static asset cache (using appropriate max age for each type)
+            expired_static_keys = []
+            for k, v in static_asset_cache.items():
+                max_age = IMAGE_CACHE_MAX_AGE if k.startswith('image:') else STATIC_CACHE_MAX_AGE
+                if current_time - v['timestamp'] > max_age:
+                    expired_static_keys.append(k)
             for key in expired_static_keys:
                 del static_asset_cache[key]
                 
