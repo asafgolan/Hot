@@ -115,15 +115,38 @@ def send_logs_to_mac(mac_host, mac_port=8001):
 class HotDomainHandler(http.server.BaseHTTPRequestHandler):
     """HTTP handler that processes hot.net domain requests"""
     
+    error_count = 0
+    request_count = 0
+    last_log_send_time = time.time()
+    
     def do_GET(self):
         """Handle GET requests"""
+        HotDomainHandler.request_count += 1
         self._process_request()
     
     def do_POST(self):
         """Handle POST requests"""
+        HotDomainHandler.request_count += 1
         content_length = int(self.headers.get('Content-Length', 0))
         post_data = self.rfile.read(content_length) if content_length > 0 else None
         self._process_request(post_data)
+        
+    def do_PUT(self):
+        """Handle PUT requests"""
+        HotDomainHandler.request_count += 1
+        content_length = int(self.headers.get('Content-Length', 0))
+        post_data = self.rfile.read(content_length) if content_length > 0 else None
+        self._process_request(post_data)
+        
+    def do_DELETE(self):
+        """Handle DELETE requests"""
+        HotDomainHandler.request_count += 1
+        self._process_request()
+        
+    def do_OPTIONS(self):
+        """Handle OPTIONS requests"""
+        HotDomainHandler.request_count += 1
+        self._process_request()
     
     def _process_request(self, post_data=None):
         """Process incoming requests for hot.net domains"""
@@ -134,10 +157,45 @@ class HotDomainHandler(http.server.BaseHTTPRequestHandler):
             
             logger.info(f"Received request: {self.command} {url}")
             
+            # Check for malformed request formats
+            try:
+                # Attempt to parse headers to check for formatting issues
+                headers_dict = dict(self.headers.items())
+                
+                # Check for malformed content
+                if post_data and self.headers.get('Content-Type', '').startswith('application/json'):
+                    try:
+                        # Try to parse JSON data to check for formatting issues
+                        if isinstance(post_data, bytes):
+                            json.loads(post_data.decode('utf-8'))
+                    except json.JSONDecodeError as json_err:
+                        # Log the malformed JSON issue
+                        HotDomainHandler.error_count += 1
+                        request_info = {
+                            'url': url,
+                            'method': self.command,
+                            'headers': dict(self.headers.items()),
+                            'data_sample': post_data[:200].decode('utf-8', errors='replace') if post_data else None
+                        }
+                        log_error('malformed_json', request_info, str(json_err), 400)
+                        
+                        self.send_error(400, f"Bad request: Malformed JSON data - {str(json_err)}")
+                        return
+            except Exception as format_err:
+                # Log any formatting or parsing errors
+                HotDomainHandler.error_count += 1
+                request_info = {
+                    'url': url,
+                    'method': self.command,
+                    'raw_headers': str(self.headers)
+                }
+                log_error('malformed_request', request_info, str(format_err), 400)
+                
+                self.send_error(400, f"Bad request format - {str(format_err)}")
+                return
+                
+            # Process the actual request for hot.net domains
             # Here you can implement your domain-specific handling
-            # For hot.net domains that previously used the file-based proxy
-            
-            # Example response
             self.send_response(200)
             self.send_header('Content-type', 'text/html')
             self.end_headers()
@@ -158,13 +216,60 @@ class HotDomainHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(response.encode())
             logger.info(f"Request for {url} processed successfully")
             
+            # Periodically check if we should send logs (every 50 requests or if error threshold met)
+            current_time = time.time()
+            if (HotDomainHandler.error_count >= 5 or 
+                HotDomainHandler.request_count >= 50 or 
+                (current_time - HotDomainHandler.last_log_send_time) > 300):  # 5 minutes
+                
+                # Try to send logs in a non-blocking way
+                threading.Thread(target=self._try_send_logs).start()
+                
+                # Reset counters
+                HotDomainHandler.error_count = 0
+                HotDomainHandler.request_count = 0
+                HotDomainHandler.last_log_send_time = current_time
+            
         except Exception as e:
             logger.error(f"Error processing request: {e}")
+            HotDomainHandler.error_count += 1
+            
+            # Log the general processing error
+            request_info = {
+                'url': url,
+                'method': self.command,
+                'headers': dict(self.headers.items()) if hasattr(self, 'headers') else None
+            }
+            log_error('request_processing_error', request_info, str(e), 500)
+            
             self.send_error(500, f"Internal error: {str(e)}")
     
     def log_message(self, format, *args):
         """Override to use our logger instead of printing to stderr"""
-        logger.info(format % args)
+        message = format % args
+        logger.info(message)
+        
+        # Special handling for 400 Bad Request errors
+        if '400' in message and 'Bad Request' in message:
+            HotDomainHandler.error_count += 1
+            request_info = {
+                'url': self.path if hasattr(self, 'path') else None,
+                'method': self.command if hasattr(self, 'command') else None,
+                'raw_message': message
+            }
+            log_error('bad_request', request_info, message, 400)
+    
+    def _try_send_logs(self):
+        """Try to send logs to Mac if there are errors"""
+        # Get the Mac host information from the server
+        try:
+            server = self.server
+            if hasattr(server, 'mac_host'):
+                mac_host = server.mac_host
+                mac_port = getattr(server, 'mac_port', 8001)
+                send_logs_to_mac(mac_host, mac_port)
+        except Exception as e:
+            logger.error(f"Error sending logs to Mac: {e}")
 
 
 def start_http_server(port):
