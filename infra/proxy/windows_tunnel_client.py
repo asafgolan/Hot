@@ -113,11 +113,19 @@ def send_logs_to_mac(mac_host, mac_port=8001):
         return False
 
 class HotDomainHandler(http.server.BaseHTTPRequestHandler):
-    """HTTP handler that processes hot.net domain requests"""
+    """HTTP request handler for hot.net domain requests"""
     
-    error_count = 0
+    # Class-level counters for monitoring
     request_count = 0
+    error_count = 0
     last_log_send_time = time.time()
+    
+    # Define supported protocols to help identify binary data
+    BINARY_SIGNATURES = {
+        b'\x16\x03': 'TLS handshake',
+        b'\x80\x80': 'SSL handshake',
+        b'\x00\x01': 'Binary data',
+    }
     
     def do_GET(self):
         """Handle GET requests"""
@@ -149,24 +157,42 @@ class HotDomainHandler(http.server.BaseHTTPRequestHandler):
         self._process_request()
     
     def _process_request(self, post_data=None):
-        """Process incoming requests for hot.net domains"""
-        try:
-            # Parse the request URL
-            url = self.path
-            parsed_url = urlparse(url)
-            
-            logger.info(f"Received request: {self.command} {url}")
-            
-            # Check for malformed request formats
+        """Process HTTP request - common handler for all methods"""
+        # Track requests for log sending threshold
+        HotDomainHandler.request_count += 1
+        
+        # First, check if this might be binary data (like a TLS handshake)
+        if hasattr(self, 'raw_requestline'):
             try:
-                # Attempt to parse headers to check for formatting issues
-                headers_dict = dict(self.headers.items())
-                
-                # Check for malformed content
-                if post_data and self.headers.get('Content-Type', '').startswith('application/json'):
+                # Check if this is binary data like SSL/TLS handshake
+                for sig, protocol_name in self.BINARY_SIGNATURES.items():
+                    if self.raw_requestline.startswith(sig):
+                        logger.info(f"Detected binary protocol: {protocol_name}")
+                        # This is likely a TLS/SSL connection attempt
+                        # Log it but don't treat as error
+                        request_info = {
+                            'detected_protocol': protocol_name,
+                            'raw_data_sample': self.raw_requestline[:20].hex()
+                        }
+                        
+                        # Instead of 400 error, handle properly
+                        self.send_response(200)
+                        self.send_header('Connection', 'close')
+                        self.end_headers()
+                        # Just acknowledge the binary data
+                        return
+            except Exception as binary_err:
+                logger.info(f"Error checking for binary protocol: {binary_err}")
+        
+        try:
+            url = self.path
+            
+            # Check if this is a valid HTTP request with expected headers
+            try:
+                if post_data and self.headers.get('Content-Type') == 'application/json':
                     try:
-                        # Try to parse JSON data to check for formatting issues
-                        if isinstance(post_data, bytes):
+                        # Try to parse JSON data
+                        if post_data:
                             json.loads(post_data.decode('utf-8'))
                     except json.JSONDecodeError as json_err:
                         # Log the malformed JSON issue
@@ -182,17 +208,8 @@ class HotDomainHandler(http.server.BaseHTTPRequestHandler):
                         self.send_error(400, f"Bad request: Malformed JSON data - {str(json_err)}")
                         return
             except Exception as format_err:
-                # Log any formatting or parsing errors
-                HotDomainHandler.error_count += 1
-                request_info = {
-                    'url': url,
-                    'method': self.command,
-                    'raw_headers': str(self.headers)
-                }
-                log_error('malformed_request', request_info, str(format_err), 400)
-                
-                self.send_error(400, f"Bad request format - {str(format_err)}")
-                return
+                # Don't immediately fail - try to handle it gracefully
+                logger.info(f"Non-critical format issue: {format_err}")
                 
             # Process the actual request for hot.net domains
             # Here you can implement your domain-specific handling
@@ -258,6 +275,14 @@ class HotDomainHandler(http.server.BaseHTTPRequestHandler):
                 'raw_message': message,
                 'timestamp': datetime.datetime.now().isoformat()
             }
+            
+            # Check for binary data in the raw request
+            if hasattr(self, 'raw_requestline'):
+                # Try to identify common binary protocols
+                for sig, protocol_name in self.BINARY_SIGNATURES.items():
+                    if hasattr(self.raw_requestline, 'startswith') and self.raw_requestline.startswith(sig):
+                        request_info['detected_protocol'] = protocol_name
+                        request_info['binary_signature'] = self.raw_requestline[:10].hex()
             
             # Directly write to log file for immediate capture
             try:
