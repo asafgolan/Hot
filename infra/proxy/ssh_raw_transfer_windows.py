@@ -151,6 +151,67 @@ def cleanup_problematic_cookies():
         print(f"🧹 Cleaned up {cleaned_count} problematic cookies from jar")
         save_cookies()
 
+def ensure_hot_net_session(domain):
+    """Ensure we have a valid session for hot.net domains"""
+    if 'hot.net' not in domain:
+        return True
+        
+    # Check if we have session cookies for this domain
+    if domain in COOKIE_JAR and COOKIE_JAR[domain]:
+        session_cookies = [name for name in COOKIE_JAR[domain].keys() 
+                          if any(keyword in name.lower() for keyword in ['session', 'auth', 'login', 'user'])]
+        if session_cookies:
+            print(f"✅ Valid session cookies found for {domain}: {session_cookies}")
+            return True
+    
+    print(f"⚠️ No session cookies for {domain}, may need to establish session first")
+    return False
+
+def establish_hot_net_session(domain):
+    """Establish a fresh session by visiting the main page"""
+    if 'hot.net' not in domain:
+        return False
+        
+    try:
+        main_url = f"https://{domain}/"
+        print(f"🔄 Establishing session for {domain} by visiting main page...")
+        
+        # Create a basic request to the main page
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9,he;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+        }
+        
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        
+        req = urllib.request.Request(main_url, method='GET')
+        for header, value in headers.items():
+            req.add_header(header, value)
+        
+        response = urllib.request.urlopen(req, context=context, timeout=30)
+        response_headers = dict(response.getheaders())
+        
+        # Extract session cookies
+        extract_cookies_from_headers(response_headers, domain)
+        save_cookies()
+        
+        print(f"✅ Session established for {domain}")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Failed to establish session for {domain}: {e}")
+        return False
+
 def save_cookies():
     """Save cookies to disk"""
     try:
@@ -280,12 +341,28 @@ def get_request_priority(url):
 
 def add_browser_headers(headers, url, is_resource):
     """Add realistic browser headers optimized for caching and performance"""
+    from urllib.parse import urlparse
+    
     # Base browser headers
     base_headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br, zstd',  # Support modern compression
+        'Accept-Language': 'en-US,en;q=0.9,he;q=0.8',  # Add Hebrew for hot.net.il
+        'Accept-Encoding': 'gzip, deflate, br, zstd',
+        'Connection': 'keep-alive',
+        'DNT': '1',
+        'Upgrade-Insecure-Requests': '1',
     }
+    
+    # Add Origin and Referer for hot.net domains to maintain session
+    parsed_url = urlparse(url)
+    if 'hot.net' in parsed_url.netloc:
+        base_domain = f"{parsed_url.scheme}://{parsed_url.netloc}"
+        base_headers['Origin'] = base_domain
+        
+        # For API calls, set referer to main page to maintain session context
+        if not is_resource and ('api' in url.lower() or 'channels' in url.lower()):
+            base_headers['Referer'] = f"{base_domain}/"
+            base_headers['X-Requested-With'] = 'XMLHttpRequest'  # Common for AJAX requests
     
     # Resource-specific headers for better caching
     if is_resource:
@@ -710,6 +787,15 @@ def process_request_file(file_path):
         if any(pattern in url.lower() for pattern in ['/auth', '/login', '/signin', '/redirect']):
             print(f"⚠️ POTENTIAL REDIRECT URL: {url} (contains auth/login/redirect pattern)")
         
+        # Special handling for hot.net API endpoints
+        if 'hot.net' in url.lower() and any(pattern in url.lower() for pattern in ['channels', 'offers', 'api']):
+            print(f"🔥 HOT.NET API REQUEST: {url}")
+            # Ensure we have proper session context
+            if 'Accept' not in headers:
+                headers['Accept'] = 'application/json, text/plain, */*'
+            if 'Content-Type' not in headers and method in ['POST', 'PUT', 'PATCH']:
+                headers['Content-Type'] = 'application/json'
+        
         # Extract domain with error handling
         try:
             domain = url.split('://', 1)[-1].split('/', 1)[0] if '://' in url else url.split('/', 1)[0]
@@ -721,6 +807,13 @@ def process_request_file(file_path):
         
         # Apply cookies to request headers
         headers = apply_cookies_to_headers(headers, domain)
+        
+        # Check session state for hot.net domains
+        if not ensure_hot_net_session(domain):
+            # Try to establish session for hot.net API requests
+            if 'hot.net' in domain and any(pattern in url.lower() for pattern in ['channels', 'offers', 'api']):
+                print(f"🔄 Attempting to establish session before API request to {url}")
+                establish_hot_net_session(domain)
         
         # Handle conditional requests for better caching
         if is_resource and method == 'GET':
@@ -786,14 +879,46 @@ def process_request_file(file_path):
                 # Read response body
                 response_body = response.read() or b''
             
+            # Check for authentication-related status codes
+            if response_code in [401, 403]:
+                print(f"🚫 AUTH ERROR: {response_code} for {url} - authentication required")
+                if 'hot.net' in domain:
+                    print(f"🔄 May need to establish fresh session for {domain}")
+            
             # Check for redirect responses first (before extracting cookies)
             if response_code in [301, 302, 303, 307, 308]:
                 location = response_headers.get('Location', '')
-                print(f"🔄 REDIRECT DETECTED: {response_code} to {location}")
+                print(f"🔄 REDIRECT DETECTED: {response_code} from {url} to {location}")
+                
+                # Log all request headers to help debug redirect cause
+                print(f"📝 Request headers that led to redirect:")
+                for header, value in headers.items():
+                    if 'auth' in header.lower() or 'cookie' in header.lower() or 'session' in header.lower():
+                        print(f"   {header}: {value[:50]}...")
+                    else:
+                        print(f"   {header}: {value}")
                 
                 # Check if this is a problematic redirect back to home
-                if location and any(pattern in location.lower() for pattern in ['home', 'index', 'main', 'lobby']):
-                    print(f"⚠️ PROBLEMATIC REDIRECT: {url} -> {location} (likely home page redirect)")
+                is_problematic = False
+                if location:
+                    # Check if redirecting to root or home-like URLs
+                    location_lower = location.lower()
+                    if (location.endswith('/') and location.count('/') <= 3) or \
+                       any(pattern in location_lower for pattern in ['home', 'index', 'main', 'lobby']):
+                        is_problematic = True
+                else:
+                    is_problematic = True  # Empty location is problematic
+                
+                if is_problematic:
+                    print(f"⚠️ PROBLEMATIC REDIRECT: {url} -> {location or 'empty location'} (likely auth/session issue)")
+                    
+                    # If this is a hot.net domain, log current cookies
+                    if 'hot.net' in domain and domain in COOKIE_JAR:
+                        print(f"🍪 Current cookies for {domain}:")
+                        for cookie_name, cookie_value in COOKIE_JAR[domain].items():
+                            print(f"   {cookie_name}: {cookie_value[:20]}...")
+                else:
+                    print(f"✅ Normal redirect: {url} -> {location}")
             
             # Extract cookies from response
             extract_cookies_from_headers(response_headers, domain)

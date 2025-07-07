@@ -14,25 +14,20 @@ from collections import defaultdict
 class AuthStateManager:
     """Manages complete authentication state for hot.net domains"""
     
-    # Cookies to exclude from auth management (redirect cookies that cause issues)
+    # Cookies to exclude from auth management (only clear tracking/advertising cookies)
     EXCLUDED_COOKIES = {
-        '_cl_30', '_cr_30', '_cl_', '_cr_',  # Redirect cookies
-        'lobbyTofunnel',  # Navigation tracking
+        # Analytics and tracking cookies (safe to exclude)
         '_hjSession', '_hjSessionUser',  # Hotjar tracking
         '_ga', '_gid', '_gat', '_gcl_au',  # Google Analytics
         '_tt_enable_cookie', '_ttp',  # TikTok tracking
         'dicbo_id',  # Advertising tracking
-        # Additional redirect-related cookies
+        # Only clear redirect cookies (not session state)
         'redirect_url', 'redirect_to', 'return_url', 'return_to',
         'next_url', 'continue_url', 'target_url', 'goto_url',
         '_redirect', '_return', '_next', '_continue', '_target',
         'back_url', 'orig_url', 'original_url', 'prev_url',
-        # Session state cookies that can cause routing issues
-        'session_state', 'nav_state', 'page_state', 'route_state',
-        'current_page', 'last_page', 'visit_source', 'entry_point',
-        # Hot.net specific cookies that might cause redirects
+        # Keep session cookies but exclude clear redirect cookies
         'hot_redirect', 'hot_nav', 'hot_route', 'hot_entry',
-        'user_journey', 'page_flow', 'navigation_flow',
     }
     
     def __init__(self, auth_file_path):
