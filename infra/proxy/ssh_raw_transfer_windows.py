@@ -1249,8 +1249,12 @@ def process_request_file(file_path):
                 
         except Exception as e:
             print(f"Error making request: {e}")
+            log_to_mac('main', 'ERROR', f"HTTP request failed for {url}: {str(e)}")
+            log_to_mac('main', 'ERROR', f"Error type: {type(e).__name__}")
             import traceback
-            traceback.print_exc()
+            error_trace = traceback.format_exc()
+            print(error_trace)
+            log_to_mac('main', 'ERROR', f"Stack trace: {error_trace}")
             
             # Create error response
             error_response = {
