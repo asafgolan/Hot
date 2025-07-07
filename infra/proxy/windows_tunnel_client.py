@@ -12,18 +12,105 @@ import logging
 import sys
 import os
 import time
+import json
+import socket
+import datetime
 import urllib.request
 import urllib.error
 from urllib.parse import urlparse
 from ssh_tunnel_proxy import SSHTunnelProxy
 
 # Setup logging
+log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, 'windows_tunnel_client.log')
+error_log_file = os.path.join(log_dir, 'windows_error_logs.json')
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()]
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(log_file)
+    ]
 )
 logger = logging.getLogger('windows_tunnel_client')
+
+# Initialize error log if it doesn't exist
+if not os.path.exists(error_log_file):
+    with open(error_log_file, 'w') as f:
+        json.dump([], f)
+
+# Function to log errors to JSON file
+def log_error(error_type, request_info, error_message, status_code=None):
+    """Log errors to a structured JSON file that can be sent to Mac"""
+    try:
+        # Read existing logs
+        with open(error_log_file, 'r') as f:
+            logs = json.load(f)
+        
+        # Add new log entry
+        logs.append({
+            'timestamp': datetime.datetime.now().isoformat(),
+            'error_type': error_type,
+            'status_code': status_code,
+            'request_info': request_info,
+            'error_message': str(error_message)
+        })
+        
+        # Write updated logs
+        with open(error_log_file, 'w') as f:
+            json.dump(logs, f, indent=2)
+            
+        logger.info(f"Error logged to {error_log_file}")
+    except Exception as e:
+        logger.error(f"Failed to log error to JSON: {e}")
+
+# Function to send logs to Mac
+def send_logs_to_mac(mac_host, mac_port=8001):
+    """Send error logs to Mac for centralized monitoring"""
+    try:
+        if not os.path.exists(error_log_file):
+            logger.warning("No error logs to send")
+            return False
+            
+        # Read the logs
+        with open(error_log_file, 'r') as f:
+            logs = f.read()
+            
+        # Prepare request to send logs
+        url = f"http://{mac_host}:{mac_port}/receive_logs"
+        headers = {
+            'Content-Type': 'application/json',
+            'X-Log-Source': 'windows-tunnel-client'
+        }
+        
+        # Create request
+        req = urllib.request.Request(
+            url=url, 
+            data=logs.encode(),
+            headers=headers,
+            method='POST'
+        )
+        
+        # Send logs
+        with urllib.request.urlopen(req) as response:
+            result = response.read().decode()
+            logger.info(f"Logs sent to Mac. Response: {result}")
+            
+            # After successful sending, archive the log file
+            archive_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            archive_file = os.path.join(log_dir, f"windows_error_logs_{archive_time}.json")
+            os.rename(error_log_file, archive_file)
+            
+            # Create new empty log file
+            with open(error_log_file, 'w') as f:
+                json.dump([], f)
+                
+            return True
+    except Exception as e:
+        logger.error(f"Failed to send logs to Mac: {e}")
+        return False
 
 class HotDomainHandler(http.server.BaseHTTPRequestHandler):
     """HTTP handler that processes hot.net domain requests"""
