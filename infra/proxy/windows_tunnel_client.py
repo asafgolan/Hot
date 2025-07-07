@@ -250,14 +250,40 @@ class HotDomainHandler(http.server.BaseHTTPRequestHandler):
         logger.info(message)
         
         # Special handling for 400 Bad Request errors
-        if '400' in message and 'Bad Request' in message:
+        if '400' in message:
             HotDomainHandler.error_count += 1
             request_info = {
                 'url': self.path if hasattr(self, 'path') else None,
                 'method': self.command if hasattr(self, 'command') else None,
-                'raw_message': message
+                'raw_message': message,
+                'timestamp': datetime.datetime.now().isoformat()
             }
-            log_error('bad_request', request_info, message, 400)
+            
+            # Directly write to log file for immediate capture
+            try:
+                # Force immediate write to log file
+                with open(error_log_file, 'r') as f:
+                    try:
+                        logs = json.load(f)
+                    except json.JSONDecodeError:
+                        logs = []
+                
+                # Add new log entry
+                logs.append({
+                    'timestamp': datetime.datetime.now().isoformat(),
+                    'error_type': 'bad_request_format',
+                    'status_code': 400,
+                    'request_info': request_info,
+                    'error_message': message
+                })
+                
+                # Write updated logs
+                with open(error_log_file, 'w') as f:
+                    json.dump(logs, f, indent=2)
+                    
+                logger.info(f"400 error logged to {error_log_file}")
+            except Exception as e:
+                logger.error(f"Failed to log 400 error to JSON: {e}")
     
     def _try_send_logs(self):
         """Try to send logs to Mac if there are errors"""
