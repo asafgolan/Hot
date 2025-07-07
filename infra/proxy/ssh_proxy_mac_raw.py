@@ -35,8 +35,11 @@ ENABLE_COMPRESSION = True  # Compress responses when possible
 COMPRESSION_MIN_SIZE = 1024  # Only compress files larger than 1KB
 COMPRESSION_TYPES = ['text/html', 'text/css', 'application/javascript', 'application/json', 'text/plain']
 
-# Setup logging
+# Setup logging with enhanced debugging for redirect issues
 LOG_FILE = os.path.expanduser("~/Hot/infra/proxy/proxy_debug.log")
+REDIRECT_LOG_FILE = os.path.expanduser("~/Hot/infra/proxy/redirect_debug.log")
+SESSION_LOG_FILE = os.path.expanduser("~/Hot/infra/proxy/session_debug.log")
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -46,6 +49,20 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Dedicated redirect logger
+redirect_logger = logging.getLogger('redirect_debug')
+redirect_handler = logging.FileHandler(REDIRECT_LOG_FILE)
+redirect_handler.setFormatter(logging.Formatter('%(asctime)s [REDIRECT] %(message)s'))
+redirect_logger.addHandler(redirect_handler)
+redirect_logger.setLevel(logging.INFO)
+
+# Dedicated session logger
+session_logger = logging.getLogger('session_debug')
+session_handler = logging.FileHandler(SESSION_LOG_FILE)
+session_handler.setFormatter(logging.Formatter('%(asctime)s [SESSION] %(message)s'))
+session_logger.addHandler(session_handler)
+session_logger.setLevel(logging.INFO)
 
 # Directories - Windows will SSH into Mac to fetch these
 LOCAL_BASE_DIR = os.path.expanduser("~/Hot/infra/proxy/ssh_transfer")
@@ -168,6 +185,17 @@ class RawContentProxyHandler(http.server.BaseHTTPRequestHandler):
         if DEBUG:
             print(f"Proxying {method} {url} through Windows via SSH (raw content)")
         
+        # Log detailed request info for debugging redirects
+        if 'hot.net' in host:
+            redirect_logger.info(f"HOT.NET REQUEST: {method} {url}")
+            redirect_logger.info(f"Host: {host}, Path: {parsed_url.path}")
+            redirect_logger.info(f"Headers received from browser:")
+            for header, value in self.headers.items():
+                if 'cookie' in header.lower() or 'auth' in header.lower() or 'session' in header.lower():
+                    redirect_logger.info(f"  {header}: {value[:100]}...")
+                else:
+                    redirect_logger.info(f"  {header}: {value}")
+        
         # Determine if this is a resource request
         is_resource = self._is_resource_request(parsed_url.path)
         
@@ -213,6 +241,20 @@ class RawContentProxyHandler(http.server.BaseHTTPRequestHandler):
         # Prepare and write request data if not duplicate
         if not duplicate_request:
             request_data = self._prepare_request_data(method, url, request_id, is_resource)
+            
+            # Log request data for hot.net debugging
+            if 'hot.net' in host:
+                redirect_logger.info(f"REQUEST DATA for {request_id}:")
+                redirect_logger.info(f"  URL: {request_data.get('url')}")
+                redirect_logger.info(f"  Method: {request_data.get('method')}")
+                redirect_logger.info(f"  Is Resource: {request_data.get('is_resource')}")
+                redirect_logger.info(f"  Headers being sent to Windows:")
+                for header, value in request_data.get('headers', {}).items():
+                    if 'cookie' in header.lower() or 'auth' in header.lower():
+                        redirect_logger.info(f"    {header}: {value[:100]}...")
+                    else:
+                        redirect_logger.info(f"    {header}: {value}")
+            
             success = self._write_request_file(request_data, request_id)
             if not success:
                 self.send_error(500, "Failed to write request file")
@@ -662,6 +704,25 @@ class RawContentProxyHandler(http.server.BaseHTTPRequestHandler):
                 compressed_size = len(content_bytes)
                 ratio = (1 - compressed_size / original_size) * 100
                 print(f"Applied compression: {original_size}→{compressed_size} bytes ({ratio:.1f}% reduction)")
+            
+            # Log response data for hot.net debugging
+            if 'hot.net' in url:
+                redirect_logger.info(f"RESPONSE from Windows for {url}:")
+                redirect_logger.info(f"  Status: {status_code}")
+                redirect_logger.info(f"  Content Size: {len(content_bytes)} bytes")
+                redirect_logger.info(f"  Response Headers:")
+                for header, value in headers.items():
+                    if header.lower() in ['location', 'set-cookie', 'cache-control', 'expires']:
+                        redirect_logger.info(f"    {header}: {value}")
+                    elif 'cookie' in header.lower():
+                        redirect_logger.info(f"    {header}: {value[:100]}...")
+                
+                # Log redirect detection
+                if status_code in [301, 302, 303, 307, 308]:
+                    location = headers.get('Location', '')
+                    redirect_logger.warning(f"REDIRECT DETECTED: {status_code} from {url} to {location}")
+                    if location and (location.endswith('/') or 'home' in location.lower() or 'index' in location.lower()):
+                        redirect_logger.error(f"PROBLEMATIC REDIRECT: This might be a session/auth issue!")
             
             # Send response
             self.send_response(status_code)

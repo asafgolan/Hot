@@ -88,6 +88,51 @@ request_processing_queue = queue.Queue(maxsize=50)
 response_upload_queue = queue.Queue(maxsize=50)
 processing_executor = None
 
+# Enhanced logging system that sends logs to Mac
+import logging
+import threading
+from datetime import datetime
+
+# Local log files
+LOCAL_LOG_DIR = os.path.join(WINDOWS_BASE, "logs")
+os.makedirs(LOCAL_LOG_DIR, exist_ok=True)
+
+WINDOWS_MAIN_LOG = os.path.join(LOCAL_LOG_DIR, "windows_main.log")
+WINDOWS_REDIRECT_LOG = os.path.join(LOCAL_LOG_DIR, "windows_redirect.log")
+WINDOWS_SESSION_LOG = os.path.join(LOCAL_LOG_DIR, "windows_session.log")
+
+# Mac log directories (will be sent via SSH)
+MAC_LOG_DIR = f"{MAC_SSH_CONFIG['remote_base']}/logs"
+
+# Setup loggers
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler(WINDOWS_MAIN_LOG),
+        logging.StreamHandler()
+    ]
+)
+main_logger = logging.getLogger('windows_main')
+
+# Redirect debug logger
+redirect_logger = logging.getLogger('windows_redirect')
+redirect_handler = logging.FileHandler(WINDOWS_REDIRECT_LOG)
+redirect_handler.setFormatter(logging.Formatter('%(asctime)s [REDIRECT] %(message)s'))
+redirect_logger.addHandler(redirect_handler)
+redirect_logger.setLevel(logging.INFO)
+
+# Session debug logger  
+session_logger = logging.getLogger('windows_session')
+session_handler = logging.FileHandler(WINDOWS_SESSION_LOG)
+session_handler.setFormatter(logging.Formatter('%(asctime)s [SESSION] %(message)s'))
+session_logger.addHandler(session_handler)
+session_logger.setLevel(logging.INFO)
+
+# Log sync queue
+log_sync_queue = queue.Queue(maxsize=100)
+log_sync_lock = threading.Lock()
+
 # Ensure directories exist
 for directory in [INCOMING_DIR, OUTGOING_DIR, CACHE_DIR, RAW_CONTENT_DIR]:
     os.makedirs(directory, exist_ok=True)
@@ -111,6 +156,113 @@ def return_ssh_connection(conn):
         ssh_connection_pool.put_nowait(conn)
     except queue.Full:
         pass  # Pool is full, discard connection
+
+def log_to_mac(logger_name, level, message):
+    """Queue a log message to be sent to Mac"""
+    try:
+        log_entry = {
+            'timestamp': datetime.now().isoformat(),
+            'logger': logger_name,
+            'level': level,
+            'message': message,
+            'source': 'windows'
+        }
+        log_sync_queue.put_nowait(log_entry)
+    except queue.Full:
+        pass  # Drop logs if queue is full to avoid blocking
+
+def upload_logs_to_mac():
+    """Upload all log files to Mac via SSH"""
+    try:
+        # Create logs directory on Mac
+        ssh_cmd = build_ssh_cmd(f"mkdir -p {MAC_LOG_DIR}", is_command=True)
+        subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=10)
+        
+        # Upload each log file
+        log_files = [
+            (WINDOWS_MAIN_LOG, "windows_main.log"),
+            (WINDOWS_REDIRECT_LOG, "windows_redirect.log"),
+            (WINDOWS_SESSION_LOG, "windows_session.log")
+        ]
+        
+        for local_file, filename in log_files:
+            if os.path.exists(local_file) and os.path.getsize(local_file) > 0:
+                # Upload using SCP
+                scp_cmd = ['scp', '-q']
+                if MAC_SSH_CONFIG.get('key_file'):
+                    scp_cmd.extend(['-i', MAC_SSH_CONFIG['key_file']])
+                
+                scp_cmd.extend([
+                    '-o', 'ConnectTimeout=10',
+                    '-o', 'StrictHostKeyChecking=no',
+                    '-o', 'BatchMode=yes',
+                    local_file,
+                    f"{MAC_SSH_CONFIG['user']}@{MAC_SSH_CONFIG['host']}:{MAC_LOG_DIR}/{filename}"
+                ])
+                
+                result = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=15)
+                if result.returncode == 0:
+                    print(f"📤 Uploaded log to Mac: {filename}")
+                else:
+                    print(f"❌ Failed to upload log {filename}: {result.stderr}")
+        
+        return True
+        
+    except Exception as e:
+        print(f"Error uploading logs to Mac: {e}")
+        return False
+
+def sync_logs_continuously():
+    """Background thread to continuously sync logs to Mac"""
+    batch_logs = []
+    last_upload = time.time()
+    upload_interval = 30  # Upload every 30 seconds
+    
+    while True:
+        try:
+            # Collect log entries
+            try:
+                log_entry = log_sync_queue.get(timeout=5)
+                if log_entry is None:  # Shutdown signal
+                    break
+                batch_logs.append(log_entry)
+                log_sync_queue.task_done()
+            except queue.Empty:
+                pass
+            
+            # Upload logs periodically
+            current_time = time.time()
+            if (current_time - last_upload) > upload_interval or len(batch_logs) > 50:
+                if batch_logs:
+                    # Write batched logs to files
+                    with log_sync_lock:
+                        try:
+                            # Append to appropriate log files
+                            for log_entry in batch_logs:
+                                log_line = f"{log_entry['timestamp']} [{log_entry['level']}] {log_entry['message']}\n"
+                                
+                                if log_entry['logger'] == 'redirect':
+                                    with open(WINDOWS_REDIRECT_LOG, 'a', encoding='utf-8') as f:
+                                        f.write(log_line)
+                                elif log_entry['logger'] == 'session':
+                                    with open(WINDOWS_SESSION_LOG, 'a', encoding='utf-8') as f:
+                                        f.write(log_line)
+                                else:
+                                    with open(WINDOWS_MAIN_LOG, 'a', encoding='utf-8') as f:
+                                        f.write(log_line)
+                            
+                            # Upload to Mac
+                            upload_logs_to_mac()
+                            batch_logs = []
+                            last_upload = current_time
+                            
+                        except Exception as e:
+                            print(f"Error writing batch logs: {e}")
+                            batch_logs = []  # Clear to avoid infinite loop
+                
+        except Exception as e:
+            print(f"Error in log sync thread: {e}")
+            time.sleep(5)  # Wait before retrying
 
 def load_cookies():
     """Load cookies from disk if available"""
@@ -783,13 +935,29 @@ def process_request_file(file_path):
         
         print(f"Processing request: {url} (Resource: {is_resource})")
         
+        # Enhanced logging for all hot.net requests
+        if 'hot.net' in url.lower():
+            log_to_mac('main', 'INFO', f"HOT.NET REQUEST: {method} {url}")
+            log_to_mac('main', 'INFO', f"Is Resource: {is_resource}")
+            log_to_mac('main', 'INFO', f"User-Agent: {headers.get('User-Agent', 'None')}")
+            log_to_mac('main', 'INFO', f"Referer: {headers.get('Referer', 'None')}")
+            
+            # Log cookies being sent
+            if 'Cookie' in headers:
+                cookie_str = headers['Cookie']
+                cookie_count = len(cookie_str.split(';')) if cookie_str else 0
+                log_to_mac('session', 'INFO', f"Sending {cookie_count} cookies to {url}")
+                log_to_mac('session', 'DEBUG', f"Cookies: {cookie_str[:200]}...")
+        
         # Debug: Check if this URL might cause redirect issues
         if any(pattern in url.lower() for pattern in ['/auth', '/login', '/signin', '/redirect']):
             print(f"⚠️ POTENTIAL REDIRECT URL: {url} (contains auth/login/redirect pattern)")
+            log_to_mac('redirect', 'WARNING', f"POTENTIAL REDIRECT URL: {url} (contains auth/login/redirect pattern)")
         
         # Special handling for hot.net API endpoints
         if 'hot.net' in url.lower() and any(pattern in url.lower() for pattern in ['channels', 'offers', 'api']):
             print(f"🔥 HOT.NET API REQUEST: {url}")
+            log_to_mac('main', 'INFO', f"HOT.NET API REQUEST: {method} {url}")
             # Ensure we have proper session context
             if 'Accept' not in headers:
                 headers['Accept'] = 'application/json, text/plain, */*'
@@ -890,12 +1058,21 @@ def process_request_file(file_path):
                 location = response_headers.get('Location', '')
                 print(f"🔄 REDIRECT DETECTED: {response_code} from {url} to {location}")
                 
-                # Log all request headers to help debug redirect cause
-                print(f"📝 Request headers that led to redirect:")
+                # Comprehensive redirect logging to Mac
+                log_to_mac('redirect', 'WARNING', f"REDIRECT DETECTED: {response_code} from {url} to {location}")
+                log_to_mac('redirect', 'INFO', f"Original request method: {method}")
+                log_to_mac('redirect', 'INFO', f"Response headers:")
+                for header, value in response_headers.items():
+                    if header.lower() in ['location', 'set-cookie', 'cache-control', 'expires', 'server']:
+                        log_to_mac('redirect', 'INFO', f"  {header}: {value}")
+                
+                log_to_mac('redirect', 'INFO', f"Request headers that led to redirect:")
                 for header, value in headers.items():
                     if 'auth' in header.lower() or 'cookie' in header.lower() or 'session' in header.lower():
+                        log_to_mac('redirect', 'INFO', f"  {header}: {value[:100]}...")
                         print(f"   {header}: {value[:50]}...")
                     else:
+                        log_to_mac('redirect', 'INFO', f"  {header}: {value}")
                         print(f"   {header}: {value}")
                 
                 # Check if this is a problematic redirect back to home
@@ -911,14 +1088,20 @@ def process_request_file(file_path):
                 
                 if is_problematic:
                     print(f"⚠️ PROBLEMATIC REDIRECT: {url} -> {location or 'empty location'} (likely auth/session issue)")
+                    log_to_mac('redirect', 'ERROR', f"PROBLEMATIC REDIRECT: {url} -> {location or 'empty location'} (likely auth/session issue)")
                     
                     # If this is a hot.net domain, log current cookies
                     if 'hot.net' in domain and domain in COOKIE_JAR:
                         print(f"🍪 Current cookies for {domain}:")
+                        log_to_mac('session', 'INFO', f"Current cookies for {domain} during problematic redirect:")
                         for cookie_name, cookie_value in COOKIE_JAR[domain].items():
                             print(f"   {cookie_name}: {cookie_value[:20]}...")
+                            log_to_mac('session', 'INFO', f"  {cookie_name}: {cookie_value[:50]}...")
+                    else:
+                        log_to_mac('session', 'WARNING', f"No cookies found for domain {domain} during redirect")
                 else:
                     print(f"✅ Normal redirect: {url} -> {location}")
+                    log_to_mac('redirect', 'INFO', f"Normal redirect: {url} -> {location}")
             
             # Extract cookies from response
             extract_cookies_from_headers(response_headers, domain)
@@ -1250,6 +1433,12 @@ def main():
     print(f"📁 Mac remote directory: {MAC_SSH_CONFIG['remote_base']}")
     print(f"📦 Raw content threshold: {RAW_CONTENT_THRESHOLD} bytes")
     print(f"💨 Browser-like performance: Parallel processing, caching, optimized transfers")
+    print(f"📤 Enhanced logging: Windows logs will be sent to Mac at {MAC_LOG_DIR}")
+    
+    # Log startup to Mac
+    log_to_mac('main', 'INFO', f"Windows SSH Handler started at {datetime.datetime.now()}")
+    log_to_mac('main', 'INFO', f"Connecting to Mac: {MAC_SSH_CONFIG['user']}@{MAC_SSH_CONFIG['host']}")
+    log_to_mac('main', 'INFO', f"Log sync enabled with 30-second intervals")
     
     # Handle cookie options
     if args.reset_cookies:
@@ -1294,6 +1483,11 @@ def main():
     upload_thread = threading.Thread(target=upload_queue_processor, daemon=True)
     upload_thread.start()
     
+    # Start log sync thread
+    log_sync_thread = threading.Thread(target=sync_logs_continuously, daemon=True)
+    log_sync_thread.start()
+    print("📤 Log sync thread started - Windows logs will be sent to Mac every 30 seconds")
+    
     # Ultra-fast main loop with adaptive polling
     try:
         consecutive_empty = 0
@@ -1334,9 +1528,17 @@ def main():
     except KeyboardInterrupt:
         print("\n🛑 Shutting down ultra-fast handler...")
         
-        # Signal upload thread to stop
+        # Signal threads to stop
         response_upload_queue.put(None)
+        log_sync_queue.put(None)
+        
+        # Wait for threads to finish
         upload_thread.join(timeout=2)
+        log_sync_thread.join(timeout=5)
+        
+        # Final log upload
+        print("📤 Final log upload to Mac...")
+        upload_logs_to_mac()
         
         # Save state
         save_cookies()
@@ -1345,6 +1547,7 @@ def main():
         elapsed_total = time.time() - start_time
         cache_hits = len(RESPONSE_CACHE)
         print(f"📊 Final stats: {total_processed} loops in {elapsed_total:.1f}s, {cache_hits} responses cached")
+        log_to_mac('main', 'INFO', f"Handler shutdown: {total_processed} loops, {cache_hits} cached responses")
         print("✅ Shutdown complete")
         
     except Exception as e:
