@@ -272,11 +272,16 @@ class HotDomainHandler(http.server.BaseHTTPRequestHandler):
             logger.error(f"Error sending logs to Mac: {e}")
 
 
-def start_http_server(port):
+def start_http_server(port, mac_host=None, mac_port=8001):
     """Start the HTTP server for handling requests"""
     try:
         handler = HotDomainHandler
         httpd = socketserver.ThreadingTCPServer(("", port), handler)
+        
+        # Store Mac host info for log sending
+        if mac_host:
+            httpd.mac_host = mac_host
+            httpd.mac_port = mac_port
         
         logger.info(f"Starting HTTP server on port {port}")
         server_thread = threading.Thread(target=httpd.serve_forever)
@@ -298,12 +303,16 @@ def main():
     parser.add_argument('--local-port', type=int, default=8080, 
                       help='Local port for HTTP server')
     parser.add_argument('--remote-port', type=int, default=8080, 
-                      help='Remote port on Mac for the tunnel')
+                      help='Remote port on Mac for SSH tunnel')
+    parser.add_argument('--mac-proxy-port', type=int, default=8001,
+                      help='Mac proxy port for sending logs back')
+    parser.add_argument('--send-logs', action='store_true',
+                      help='Enable sending logs to Mac')
     
     args = parser.parse_args()
     
-    # Start local HTTP server
-    httpd = start_http_server(args.local_port)
+    # Start the HTTP server with Mac host info for log sending
+    httpd = start_http_server(args.local_port, args.mac_host, args.mac_proxy_port)
     if not httpd:
         logger.error("Failed to start local HTTP server. Exiting.")
         sys.exit(1)
@@ -320,22 +329,37 @@ def main():
         logger.info(f"Tunnel started successfully. Windows HTTP server on port {args.local_port} is now available on Mac at localhost:{args.remote_port}")
         
         try:
-            # Keep the script running
+            # Send initial logs if there are any and sending is enabled
+            if args.send_logs:
+                logger.info("Checking for logs to send to Mac...")
+                send_logs_to_mac(args.mac_host, args.mac_proxy_port)
+            
+            logger.info("Press Ctrl+C to stop the client")
             while True:
+                # Check if tunnel is active, restart if needed
                 if not tunnel.check_tunnel():
-                    logger.warning("Tunnel disconnected. Attempting to restart...")
-                    tunnel.stop_tunnel()
-                    if not tunnel.start_tunnel():
-                        logger.error("Failed to restart tunnel. Exiting.")
-                        break
-                time.sleep(60)  # Check every minute
+                    logger.info("Tunnel not active, restarting...")
+                    tunnel.start_tunnel()
                 
+                # Periodically send logs if enabled
+                if args.send_logs and time.time() - HotDomainHandler.last_log_send_time > 300:
+                    threading.Thread(target=lambda: send_logs_to_mac(args.mac_host, args.mac_proxy_port)).start()
+                    HotDomainHandler.last_log_send_time = time.time()
+                    
+                time.sleep(60)  # Check every minute
         except KeyboardInterrupt:
             logger.info("Received keyboard interrupt, shutting down...")
         finally:
-            logger.info("Stopping HTTP server and SSH tunnel...")
-            httpd.shutdown()
-            tunnel.stop_tunnel()
+            # Send final logs before shutting down
+            if args.send_logs:
+                logger.info("Sending final logs before shutdown...")
+                send_logs_to_mac(args.mac_host, args.mac_proxy_port)
+                
+            # Clean up
+            if tunnel:
+                tunnel.stop_tunnel()
+            if httpd:
+                httpd.shutdown()
     else:
         logger.error("Failed to start tunnel")
         httpd.shutdown()
