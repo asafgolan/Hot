@@ -1,12 +1,26 @@
-1. feature related:
 
+----------------------
+1. feature related:
+----------------------
 1.1 who  is fiber and who is fiber ready
 1.2 general error not showing for fiber ? asaf golan already fiber user
+1.3 can u run api test to test striclty if content is populated for the content populated dom elements?
+14. general content UAT/integration reltaed tests.
 
-
+----------------------
 2. workflow related:
-
+----------------------
 reporting of exising issues to qc 
 create issue for general error not showing mention ```asaf golan already fiber user``` 
 
+----------------------      
 3. permission related:
+----------------------
+3.1 regarding point 1.3!!! we might need content editor permissions 
+
+----------------------
+4. tzur UX related:
+----------------------
+4.1 please add url in spec fir usability bread crumbs and browser back button (history)
+
+

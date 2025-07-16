@@ -22,6 +22,17 @@ This section contains all reported bugs for the Cable to Fiber Upgrade Flow (DD_
 
 </details>
 
+<details>
+<summary><strong>02-logged-in-user-invalid-99-success-msg-OPEN</strong>: Fiber User Receives Incorrect Success Code 99 - OPEN</summary>
+
+- **Reported**: 2025-07-16
+- **Severity**: High
+- **Component**: User eligibility validation
+- **Details**: [Full bug report](./02-logged-in-user-invalid-99-success-msg-OPEN/issue.md)
+- **Screenshots**: [Expected](./02-logged-in-user-invalid-99-success-msg-OPEN/assets/valid_welcome_view_expected.png) | [Actual](./02-logged-in-user-invalid-99-success-msg-OPEN/assets/invalid_success_msg_actual.png)
+
+</details>
+
 <!-- Add new bugs here following the same pattern -->
 
 ## Bug Reporting Guidelines

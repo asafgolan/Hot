@@ -36,6 +36,9 @@ graph TD
     Start[Customer Receives SMS] -->|SMS contains URL: /upgrade-fiber| Click[Customer clicks URL]
     Click --> SessionCheck{Is Session Valid?}
     SessionCheck -->|No| LoginRedirect[Redirect to Login: /login?PageName=upgrade-fiber%2Fwelcome]
+    LoginRedirect -->|User inputs valid ID and phone| OtpRequest[OTP SMS Sent to Phone]
+    OtpRequest -->|User inputs OTP received via SMS| LoginSuccess[Login Success]
+    LoginSuccess --> ProcessEntry
     SessionCheck -->|Yes| ProcessEntry[Process Entry in Personal Zone: /upgrade-fiber/welcome]
     
     %% Entry to Process

@@ -14,6 +14,7 @@
       * [Observability](web/feature/DD_CR12575/03-observability.md)
       * [Known Issues](web/feature/DD_CR12575/bugs/README.md)
         * [01-Missing Text-OPEN](web/feature/DD_CR12575/bugs/01-missing-text-open/01-missing-text.md)
+        * [02-Fiber User Success Code 99-OPEN](web/feature/DD_CR12575/bugs/02-logged-in-user-invalid-99-success-msg-OPEN/issue.md)
 * TV & Streaming
   * [Streamer Overview](streamer/readme.md)
   * [Introduction](streamer/intro.md)
