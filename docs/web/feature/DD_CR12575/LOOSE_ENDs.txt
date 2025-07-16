@@ -1,0 +1,12 @@
+1. feature related:
+
+1.1 who  is fiber and who is fiber ready
+1.2 general error not showing for fiber ? asaf golan already fiber user
+
+
+2. workflow related:
+
+reporting of exising issues to qc 
+create issue for general error not showing mention ```asaf golan already fiber user``` 
+
+3. permission related:

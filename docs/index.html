@@ -36,13 +36,20 @@
   <script src="//cdn.jsdelivr.net/npm/docsify@4"></script>
   <!-- Mermaid -->
   <script src="//cdn.jsdelivr.net/npm/mermaid@8/dist/mermaid.min.js"></script>
+  <!-- Pan-zoom for diagrams -->
+  <script src="//cdn.jsdelivr.net/npm/svg-pan-zoom@3.6.1/dist/svg-pan-zoom.min.js"></script>
   <script>
     var num = 0;
     mermaid.initialize({ 
       startOnLoad: true,
       theme: 'default',
       securityLevel: 'loose',
-      logLevel: 'info'
+      logLevel: 'info',
+      flowchart: {
+        useMaxWidth: false,
+        htmlLabels: true,
+        curve: 'basis'
+      }
     });
     
     // Re-render mermaid diagrams after each page change
@@ -50,6 +57,28 @@
       var callback = function() {
         // Reset and re-initialize mermaid
         mermaid.init(undefined, '.mermaid');
+        
+        // Add pan-zoom to all mermaid SVGs after rendering
+        setTimeout(function() {
+          document.querySelectorAll('.mermaid svg').forEach(function(svg) {
+            // Add a container with border to show it's interactive
+            var container = svg.parentNode;
+            container.style.border = '1px solid #ccc';
+            container.style.borderRadius = '4px';
+            container.style.margin = '20px 0';
+            container.style.overflow = 'hidden';
+            
+            // Enable pan-zoom
+            svgPanZoom(svg, {
+              zoomEnabled: true,
+              controlIconsEnabled: true,
+              fit: true,
+              center: true,
+              minZoom: 0.1,
+              maxZoom: 10
+            });
+          });
+        }, 1000); // Wait for diagrams to fully render
       };
       var observer = new MutationObserver(callback);
       var options = {

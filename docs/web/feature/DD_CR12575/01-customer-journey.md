@@ -1,3 +1,5 @@
+
+
 # Customer Journey
 
 This flow diagram shows the complete Cable to Fiber upgrade process from initial SMS to installation scheduling.
@@ -5,6 +7,30 @@ This flow diagram shows the complete Cable to Fiber upgrade process from initial
 ## Traverse the flow
 
 ```mermaid
+%%{
+  init: {
+    'theme': 'default',
+    'flowchart': {
+      'useMaxWidth': false,
+      'htmlLabels': true,
+      'curve': 'basis',
+      'nodeSpacing': 100,
+      'rankSpacing': 120
+    },
+    'themeVariables': {
+      'nodeBorder': '#9370DB',
+      'mainBkg': '#ECECFF',
+      'nodeTextSize': '20px',
+      'edgeLabelBackground': '#e8e8e8',
+      'fontSize': '18px',
+      'primaryBorderWidth': '2px',
+      'primaryColor': '#1f77b4',
+      'primaryTextColor': '#333333',
+      'lineColor': '#333333',
+      'arrowheadColor': '#333333'
+    }
+  }
+}%%
 graph TD
     %% Initial SMS and Landing Flow
     Start[Customer Receives SMS] -->|SMS contains URL: /upgrade-fiber| Click[Customer clicks URL]
